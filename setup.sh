@@ -1,11 +1,11 @@
 #!/bin/bash
-# Progress Checker — initial setup
+# てくてく — initial setup
 set -e
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$DIR"
 
-echo "=== Progress Checker セットアップ ==="
+echo "=== てくてく セットアップ ==="
 echo ""
 
 # Python 3 check

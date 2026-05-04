@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Progress Checker — macOS menu bar app with native AppKit dialogs."""
+"""てくてく — macOS menu bar productivity app with native AppKit dialogs."""
 import json
 import os
 from datetime import datetime, timedelta
@@ -20,7 +20,8 @@ from AppKit import (
     NSWindow,
 )
 
-DATA_FILE = os.path.expanduser("~/.progress_checker.json")
+DATA_FILE = os.path.expanduser("~/.tekuteku.json")
+_OLD_DATA_FILE = os.path.expanduser("~/.progress_checker.json")
 DEFAULT_INTERVAL = 20  # minutes
 BREAK_MINUTES = 5
 
@@ -423,6 +424,8 @@ class ProgressChecker(rumps.App):
     # ── Persistence ───────────────────────────────────────────────────────
 
     def _load(self) -> dict:
+        if not os.path.exists(DATA_FILE) and os.path.exists(_OLD_DATA_FILE):
+            os.rename(_OLD_DATA_FILE, DATA_FILE)
         if os.path.exists(DATA_FILE):
             try:
                 with open(DATA_FILE) as f:

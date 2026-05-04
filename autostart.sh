@@ -1,8 +1,8 @@
 #!/bin/bash
-# Register Progress Checker as a login item via launchd
+# Register てくてく as a login item via launchd
 set -e
 
-LABEL="com.user.progress-checker"
+LABEL="com.user.tekuteku"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PYTHON="$SCRIPT_DIR/.venv/bin/python"
@@ -10,6 +10,13 @@ PYTHON="$SCRIPT_DIR/.venv/bin/python"
 if [ ! -f "$PYTHON" ]; then
     echo "❌ .venv が見つかりません。先に bash setup.sh を実行してください。"
     exit 1
+fi
+
+# Remove old progress-checker launchd entry if it exists
+OLD_PLIST="$HOME/Library/LaunchAgents/com.user.progress-checker.plist"
+if [ -f "$OLD_PLIST" ]; then
+    launchctl unload "$OLD_PLIST" 2>/dev/null || true
+    rm "$OLD_PLIST"
 fi
 
 mkdir -p "$HOME/Library/LaunchAgents"
@@ -31,9 +38,9 @@ cat > "$PLIST" << EOF
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>$HOME/.progress_checker.log</string>
+    <string>$HOME/.tekuteku.log</string>
     <key>StandardErrorPath</key>
-    <string>$HOME/.progress_checker.log</string>
+    <string>$HOME/.tekuteku.log</string>
 </dict>
 </plist>
 EOF
@@ -43,7 +50,7 @@ launchctl unload "$PLIST" 2>/dev/null || true
 launchctl load "$PLIST"
 
 echo "✅ ログイン時に自動起動するよう設定しました"
-echo "   ログ: ~/.progress_checker.log"
+echo "   ログ: ~/.tekuteku.log"
 echo ""
 echo "解除したい場合:"
 echo "  launchctl unload $PLIST && rm $PLIST"
