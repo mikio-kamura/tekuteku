@@ -26,6 +26,8 @@ from AppKit import (
     NSStrikethroughStyleAttributeName,
     NSTableColumn,
     NSTableView,
+    NSButtonCell,
+    NSImageView,
     NSTextField,
     NSTextView,
     NSView,
@@ -36,6 +38,8 @@ DATA_FILE = os.path.expanduser("~/.tekuteku.json")
 _OLD_DATA_FILE = os.path.expanduser("~/.progress_checker.json")
 DEFAULT_INTERVAL = 20  # minutes
 BREAK_MINUTES = 5
+WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+WEEKDAY_JP    = ["月",  "火",  "水",  "木",  "金",  "土",  "日"]
 
 # NSWindowStyleMask: Titled | Closable | Miniaturizable
 _STYLE = 1 | 2 | 4
@@ -133,6 +137,50 @@ def _truncate10(text: str) -> str:
     return s if len(s) <= 10 else s[:10] + "…"
 
 
+# ── Week helpers ──────────────────────────────────────────────────────────────
+
+def _monday_of(d: datetime) -> datetime:
+    return d - timedelta(days=d.weekday())
+
+def _week_range_str(d: datetime) -> str:
+    mon = _monday_of(d)
+    sun = mon + timedelta(days=6)
+    return f"{mon.month}/{mon.day}（月）〜{sun.month}/{sun.day}（日）"
+
+def _date_jp(d: datetime) -> str:
+    return f"{d.month}月{d.day}日（{WEEKDAY_JP[d.weekday()]}）"
+
+def _normalize_weekly(weekly) -> dict:
+    """Ensure weekly is {"goal": str, "week_start": str, "days": {Mon: [str,...], ...}}."""
+    base = {"goal": "", "week_start": "", "days": {k: [] for k in WEEKDAY_NAMES}}
+    if isinstance(weekly, str):
+        base["goal"] = weekly
+        return base
+    if not isinstance(weekly, dict):
+        return base
+    base["goal"] = weekly.get("goal", "")
+    base["week_start"] = weekly.get("week_start", "")
+    days = weekly.get("days", {})
+    for k in WEEKDAY_NAMES:
+        raw = days.get(k, [])
+        base["days"][k] = _parse_day_tasks(raw)
+    return base
+
+def _parse_day_tasks(raw) -> list[str]:
+    """Return list of non-empty task strings from list[str|dict] or comma string."""
+    if isinstance(raw, str):
+        return [s.strip() for s in raw.split(",") if s.strip()]
+    if isinstance(raw, list):
+        out = []
+        for item in raw:
+            if isinstance(item, str):
+                out.append(item.strip())
+            elif isinstance(item, dict):
+                out.append((item.get("text") or "").strip())
+        return [s for s in out if s]
+    return []
+
+
 def _styled_task_title(text: str, done: bool) -> NSAttributedString:
     color = NSColor.colorWithWhite_alpha_(0.45, 1.0) if done else NSColor.colorWithWhite_alpha_(0.15, 1.0)
     attrs = {NSForegroundColorAttributeName: color}
@@ -152,14 +200,19 @@ class _TodayTaskTableModel(NSObject):
     def numberOfRowsInTableView_(self, _table):
         return len(self.items)
 
-    def tableView_objectValueForTableColumn_row_(self, _table, _column, row):
+    def tableView_objectValueForTableColumn_row_(self, _table, column, row):
         if 0 <= row < len(self.items):
+            if column.identifier() == "done":
+                return 1 if self.items[row].get("done") else 0
             return self.items[row]["text"]
         return ""
 
-    def tableView_setObjectValue_forTableColumn_row_(self, _table, value, _column, row):
+    def tableView_setObjectValue_forTableColumn_row_(self, _table, value, column, row):
         if 0 <= row < len(self.items):
-            self.items[row]["text"] = str(value or "").strip()
+            if column.identifier() == "done":
+                self.items[row]["done"] = bool(value)
+            else:
+                self.items[row]["text"] = str(value or "").strip()
 
     def tableView_writeRowsWithIndexes_toPasteboard_(self, _table, row_indexes, pasteboard):
         idx = row_indexes.firstIndex()
@@ -340,6 +393,75 @@ def show_interval_input(current_minutes: int) -> Optional[int]:
         _hide()
 
 
+def show_weekly_editor(goal: str, days: dict, week_start: str = "") -> Optional[dict]:
+    """Edit weekly goal + per-day task lists (comma-separated).
+    Returns {"goal": str, "days": {Mon: [str,...], ...}} or None."""
+    W, H = 560, 420
+    win = _make_win("今週の計画", W, H)
+    cv = win.contentView()
+
+    # Compute monday date for labels
+    try:
+        mon_dt = datetime.strptime(week_start, "%Y-%m-%d") if week_start else None
+    except ValueError:
+        mon_dt = None
+
+    if mon_dt:
+        sun_dt = mon_dt + timedelta(days=6)
+        title = f"今週の計画 — {mon_dt.month}/{mon_dt.day}（月）〜{sun_dt.month}/{sun_dt.day}（日）"
+    else:
+        title = "今週の計画"
+    cv.addSubview_(_label(title, NSMakeRect(20, H-34, W-40, 22), NSFont.boldSystemFontOfSize_(13)))
+    cv.addSubview_(_label("週の目標", NSMakeRect(20, H-58, 70, 18), NSFont.boldSystemFontOfSize_(12)))
+    goal_field = _input_field(NSMakeRect(20, H-96, W-40, 34), NSFont.systemFontOfSize_(14),
+                              placeholder="今週達成したいことを入力…", default=goal)
+    cv.addSubview_(goal_field)
+    cv.addSubview_(_sep(NSMakeRect(20, H-108, W-40, 1)))
+    cv.addSubview_(_label(
+        "各曜日のタスクをカンマ区切りで入力（例: 資料作成, レビュー）",
+        NSMakeRect(20, H-126, W-40, 16),
+        NSFont.systemFontOfSize_(11),
+        color=NSColor.colorWithWhite_alpha_(0.5, 1.0),
+    ))
+
+    day_fields: dict[str, NSTextField] = {}
+    for i, (key, jp) in enumerate(zip(WEEKDAY_NAMES, WEEKDAY_JP)):
+        y = H - 156 - i * 30
+        if mon_dt:
+            day_dt = mon_dt + timedelta(days=i)
+            day_label = f"{jp} {day_dt.month}/{day_dt.day}"
+            lw = 54
+        else:
+            day_label = jp
+            lw = 24
+        cv.addSubview_(_label(day_label, NSMakeRect(20, y + 5, lw, 18),
+                              NSFont.boldSystemFontOfSize_(12),
+                              color=NSColor.colorWithWhite_alpha_(0.3, 1.0)))
+        existing = ", ".join(days.get(key, []))
+        field = _input_field(NSMakeRect(20 + lw + 6, y + 2, W - 20 - lw - 26, 22),
+                             NSFont.systemFontOfSize_(13),
+                             placeholder="タスクをカンマ区切りで", default=existing)
+        cv.addSubview_(field)
+        day_fields[key] = field
+
+    cv.addSubview_(_sep(NSMakeRect(20, 52, W-40, 1)))
+    _btn(cv, "決定", _BTN1, NSMakeRect(W-136, 12, 116, 32), primary=True)
+    win.setInitialFirstResponder_(goal_field)
+    _show(win)
+    try:
+        resp = NSApp.runModalForWindow_(win)
+        if resp == _CANCEL:
+            return None
+        result_days = {
+            key: [s.strip() for s in field.stringValue().split(",") if s.strip()]
+            for key, field in day_fields.items()
+        }
+        return {"goal": goal_field.stringValue().strip(), "days": result_days}
+    finally:
+        win.orderOut_(None)
+        _hide()
+
+
 def _parse_task_index(raw: str, tasks: list[dict]) -> Optional[str]:
     """Parse 1-based task index and return task text."""
     s = (raw or "").strip()
@@ -430,90 +552,149 @@ def show_today_task_editor(title: str, items: list[dict]) -> Optional[list]:
         _hide()
 
 
+SAM_IMG = os.path.join(os.path.dirname(__file__), "sam.png")
+
+
 def show_checkin(
     goals: dict,
+    today_date: str = "",
     current_task: str = "",
     queued_task: str = "",
     queued_next_task: str = "",
     current_message: str = "",
-) -> tuple[str, Optional[str], Optional[str], Optional[str], list]:
-    """Returns (action, next_task, next_next_task, message, updated_today_items).
+    current_interval: int = DEFAULT_INTERVAL,
+) -> tuple[str, Optional[str], Optional[str], Optional[str], Optional[int], list]:
+    """Returns (action, next_task, next_next_task, message, session_minutes, updated_today_items).
     action is one of: start, break, edit_today."""
     today_items = _normalize_today(goals.get("today", []))
+    try:
+        _today_dt = datetime.strptime(today_date, "%Y-%m-%d") if today_date else datetime.now()
+    except ValueError:
+        _today_dt = datetime.now()
     n = len(today_items)
 
-    ITEM_H = 24
+    X = 220           # left image column width (2× for larger character)
+    ITEM_H = 22       # NSTableView row height
+    MAX_VIS = 5       # max rows before scroll kicks in
     GAP = 6
-    # Fixed bottom section: y=0..364. Today section sits above y=364.
-    items_bottom_y = 364 + GAP
-    items_section_h = min(max(n, 1), 10) * ITEM_H if n else 22
+    # Fixed bottom ends at y=428; today section floats above it.
+    FIXED_BOTTOM = 428
+    items_bottom_y = FIXED_BOTTOM + GAP
+    items_section_h = min(max(n, 1), MAX_VIS) * ITEM_H if n else 22
     today_label_y = items_bottom_y + items_section_h + GAP
-    H = today_label_y + 20 + 16  # label h=20, top margin=16
+    H = today_label_y + 20 + 16
 
-    W = 480
+    W = X + 480
     win = _make_win("チェックイン", W, H)
     cv = win.contentView()
 
-    # ── 今日やりたいこと ────────────────────────────────────────────────────
+    # ── キャラクター画像（左列）────────────────────────────────────────────
+    if os.path.exists(SAM_IMG):
+        _img = NSImage.alloc().initByReferencingFile_(SAM_IMG)
+        if _img:
+            _pad = 10
+            iv = NSImageView.alloc().initWithFrame_(NSMakeRect(_pad, _pad, X - _pad * 2, H - _pad))
+            iv.setImage_(_img)
+            iv.setImageScaling_(3)   # NSImageScaleProportionallyUpOrDown
+            iv.setImageAlignment_(5)  # NSImageAlignBottom
+            cv.addSubview_(iv)
+
+    # ── 今日やりたいこと（ドラッグで並び替え可）──────────────────────────────
     cv.addSubview_(_label(
-        "📅  今日やりたいこと",
-        NSMakeRect(20, today_label_y, W-40, 20),
+        f"📅  今日やりたいこと — {_date_jp(_today_dt)}",
+        NSMakeRect(X + 20, today_label_y, W - X - 40, 20),
         NSFont.boldSystemFontOfSize_(13),
         color=NSColor.systemBlueColor(),
     ))
-    checkboxes: list[NSButton] = []
-    if today_items:
-        view_h = min(max(n, 1), 10) * ITEM_H
-        scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(24, items_bottom_y, W - 40, view_h))
-        scroll.setHasVerticalScroller_(n > 10)
-        scroll.setAutohidesScrollers_(True)
-        scroll.setBorderType_(2)
-        doc_h = max(view_h, n * ITEM_H)
-        doc = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, W - 58, doc_h))
-        for i, item in enumerate(today_items):
-            # item[0] is topmost visually → highest Y in doc coords
-            item_y = doc_h - (i + 1) * ITEM_H
-            cb = NSButton.alloc().initWithFrame_(NSMakeRect(4, item_y, W - 64, ITEM_H - 2))
-            cb.setAttributedTitle_(_styled_task_title(f"{i+1}. {item['text']}", bool(item["done"])))
-            cb.setRepresentedObject_(f"{i+1}. {item['text']}")
-            cb.setButtonType_(3)  # NSSwitchButton = checkbox
-            cb.setState_(1 if item["done"] else 0)
-            cb.setFont_(NSFont.systemFontOfSize_(13))
-            cb.setTarget_(_H)
-            cb.setAction_("toggle:")
-            doc.addSubview_(cb)
-            checkboxes.append(cb)
-        scroll.setDocumentView_(doc)
-        cv.addSubview_(scroll)
-    else:
-        cv.addSubview_(_mlabel("未設定", NSMakeRect(28, items_bottom_y, W-48, 22), NSFont.systemFontOfSize_(13)))
+    today_model = _TodayTaskTableModel.alloc().initWithItems_(today_items)
+    scroll_h = min(max(n, 1), MAX_VIS) * ITEM_H if n else 22
+    scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(X + 24, items_bottom_y, W - X - 44, scroll_h))
+    scroll.setHasVerticalScroller_(n > MAX_VIS)
+    scroll.setAutohidesScrollers_(True)
+    scroll.setBorderType_(2)
+    table_w = W - X - 60
+    today_table = NSTableView.alloc().initWithFrame_(NSMakeRect(0, 0, table_w, scroll_h))
+    today_table.setRowHeight_(float(ITEM_H - 2))
+    # Checkbox column
+    _done_col = NSTableColumn.alloc().initWithIdentifier_("done")
+    _done_col.setWidth_(22)
+    _done_col.setEditable_(True)
+    _bcell = NSButtonCell.alloc().init()
+    _bcell.setButtonType_(3)   # NSSwitchButton = checkbox
+    _bcell.setTitle_("")
+    _bcell.setControlSize_(1)  # NSControlSizeSmall
+    _done_col.setDataCell_(_bcell)
+    today_table.addTableColumn_(_done_col)
+    # Task text column
+    _task_col = NSTableColumn.alloc().initWithIdentifier_("task")
+    _task_col.setWidth_(table_w - 22 - 4)
+    _task_col.setEditable_(False)
+    _task_col.dataCell().setFont_(NSFont.systemFontOfSize_(13))
+    today_table.addTableColumn_(_task_col)
+    today_table.setHeaderView_(None)
+    today_table.setUsesAlternatingRowBackgroundColors_(True)
+    today_table.setAllowsMultipleSelection_(False)
+    today_table.setAllowsEmptySelection_(True)
+    today_table.setDataSource_(today_model)
+    today_table.setDelegate_(today_model)
+    today_table.setDraggingSourceOperationMask_forLocal_(2, True)
+    today_table.registerForDraggedTypes_([NSPasteboardTypeString])
+    scroll.setDocumentView_(today_table)
+    cv.addSubview_(scroll)
+    if not today_items:
+        cv.addSubview_(_mlabel("未設定（📝ボタンで追加）", NSMakeRect(X + 28, items_bottom_y + 2, W - X - 48, 18), NSFont.systemFontOfSize_(13)))
 
-    cv.addSubview_(_sep(NSMakeRect(20, 364, W-40, 1)))
+    cv.addSubview_(_sep(NSMakeRect(X + 20, FIXED_BOTTOM, W - X - 40, 1)))
 
-    # ── 今週 ────────────────────────────────────────────────────────────────
-    cv.addSubview_(_label("📋  今週", NSMakeRect(20, 344, W-40, 16), NSFont.boldSystemFontOfSize_(12)))
-    cv.addSubview_(_mlabel(goals.get("weekly") or "未設定", NSMakeRect(28, 318, W-48, 22), NSFont.systemFontOfSize_(12)))
-    cv.addSubview_(_sep(NSMakeRect(20, 310, W-40, 1)))
+    # ── 今週（目標 + 曜日別タスク一覧）──────────────────────────────────────
+    _weekly = goals.get("weekly", {})
+    _weekly_goal = (_weekly.get("goal") if isinstance(_weekly, dict) else str(_weekly or "")) or "未設定"
+    _weekly_days = _weekly.get("days", {}) if isinstance(_weekly, dict) else {}
+    cv.addSubview_(_label(
+        f"📋  今週 — {_week_range_str(_today_dt)}",
+        NSMakeRect(X + 20, 410, W - X - 40, 16),
+        NSFont.boldSystemFontOfSize_(13),
+    ))
+    cv.addSubview_(_mlabel(
+        _weekly_goal,
+        NSMakeRect(X + 28, 394, W - X - 48, 14),
+        NSFont.systemFontOfSize_(13),
+        color=NSColor.colorWithWhite_alpha_(0.3, 1.0),
+    ))
+    # Per-day tasks (scrollable, compact)
+    _mon = _monday_of(_today_dt)
+    _day_lines = []
+    for _i, (_key, _jp) in enumerate(zip(WEEKDAY_NAMES, WEEKDAY_JP)):
+        _ddt = _mon + timedelta(days=_i)
+        _tasks = _parse_day_tasks(_weekly_days.get(_key, []))
+        _is_today = _ddt.date() == _today_dt.date()
+        _prefix = f"▶{_jp} {_ddt.month}/{_ddt.day}" if _is_today else f"  {_jp} {_ddt.month}/{_ddt.day}"
+        _day_lines.append(f"{_prefix}: {', '.join(_tasks) if _tasks else '—'}")
+    _day_scroll, _day_tv = _text_view(_day_lines, NSMakeRect(X + 24, 322, W - X - 44, 70))
+    _day_tv.setEditable_(False)
+    _day_tv.setFont_(NSFont.systemFontOfSize_(11))
+    cv.addSubview_(_day_scroll)
+    cv.addSubview_(_sep(NSMakeRect(X + 20, 314, W - X - 40, 1)))
 
     # ── 短期目標 ────────────────────────────────────────────────────────────
-    cv.addSubview_(_label("📌  短期目標", NSMakeRect(20, 290, W-40, 16), NSFont.boldSystemFontOfSize_(12)))
-    cv.addSubview_(_mlabel(goals.get("short") or "未設定", NSMakeRect(28, 264, W-48, 22), NSFont.systemFontOfSize_(12)))
-    cv.addSubview_(_sep(NSMakeRect(20, 256, W-40, 1)))
+    cv.addSubview_(_label("📌  短期目標", NSMakeRect(X + 20, 294, W - X - 40, 16), NSFont.boldSystemFontOfSize_(13)))
+    cv.addSubview_(_mlabel(goals.get("short") or "未設定", NSMakeRect(X + 28, 270, W - X - 48, 22), NSFont.systemFontOfSize_(13)))
+    cv.addSubview_(_sep(NSMakeRect(X + 20, 262, W - X - 40, 1)))
 
     # ── 中期目標 ────────────────────────────────────────────────────────────
-    cv.addSubview_(_label("📅  中期目標", NSMakeRect(20, 236, W-40, 16), NSFont.boldSystemFontOfSize_(12)))
-    cv.addSubview_(_mlabel(goals.get("mid") or "未設定", NSMakeRect(28, 210, W-48, 22), NSFont.systemFontOfSize_(12)))
-    cv.addSubview_(_sep(NSMakeRect(20, 202, W-40, 1)))
+    cv.addSubview_(_label("📅  中期目標", NSMakeRect(X + 20, 242, W - X - 40, 16), NSFont.boldSystemFontOfSize_(13)))
+    cv.addSubview_(_mlabel(goals.get("mid") or "未設定", NSMakeRect(X + 28, 218, W - X - 48, 22), NSFont.systemFontOfSize_(13)))
+    cv.addSubview_(_sep(NSMakeRect(X + 20, 210, W - X - 40, 1)))
 
     # ── 長期目標 ────────────────────────────────────────────────────────────
-    cv.addSubview_(_label("🌟  長期目標", NSMakeRect(20, 182, W-40, 16), NSFont.boldSystemFontOfSize_(12)))
-    cv.addSubview_(_mlabel(goals.get("long") or "未設定", NSMakeRect(28, 156, W-48, 22), NSFont.systemFontOfSize_(12)))
-    cv.addSubview_(_sep(NSMakeRect(20, 148, W-40, 1)))
+    cv.addSubview_(_label("🌟  長期目標", NSMakeRect(X + 20, 190, W - X - 40, 16), NSFont.boldSystemFontOfSize_(13)))
+    cv.addSubview_(_mlabel(goals.get("long") or "未設定", NSMakeRect(X + 28, 166, W - X - 48, 22), NSFont.systemFontOfSize_(13)))
+    cv.addSubview_(_sep(NSMakeRect(X + 20, 158, W - X - 40, 1)))
 
-    # ── 次回/次々回の選択 + メッセージ ────────────────────────────────────────
-    cv.addSubview_(_label("次回・次々回にやる番号を選ぶ", NSMakeRect(20, 144, W-40, 18), NSFont.boldSystemFontOfSize_(13)))
-    cv.addSubview_(_label("次のセッション", NSMakeRect(20, 122, 110, 18), NSFont.systemFontOfSize_(12)))
-    cv.addSubview_(_label("その次（任意）", NSMakeRect(156, 122, 110, 18), NSFont.systemFontOfSize_(12)))
+    # ── 次回/次々回の選択 + セッション時間 + メッセージ ──────────────────────
+    cv.addSubview_(_label("次のセッション", NSMakeRect(X + 20,  132, 95, 16), NSFont.systemFontOfSize_(12)))
+    cv.addSubview_(_label("その次（任意）", NSMakeRect(X + 123, 132, 95, 16), NSFont.systemFontOfSize_(12)))
+    cv.addSubview_(_label("⏱分",           NSMakeRect(X + 230, 132, 40, 16), NSFont.systemFontOfSize_(12)))
 
     default_next = ""
     default_next_next = ""
@@ -529,35 +710,24 @@ def show_checkin(
         if not default_next:
             default_next = "1"
 
-    field_next = _input_field(
-        NSMakeRect(20, 102, 120, 26),
-        NSFont.systemFontOfSize_(15),
-        placeholder="番号",
-        default=default_next,
-    )
-    field_next_next = _input_field(
-        NSMakeRect(156, 102, 120, 26),
-        NSFont.systemFontOfSize_(15),
-        placeholder="任意",
-        default=default_next_next,
-    )
+    field_next     = _input_field(NSMakeRect(X + 20,  112, 95, 26), NSFont.systemFontOfSize_(15), placeholder="番号", default=default_next)
+    field_next_next= _input_field(NSMakeRect(X + 123, 112, 95, 26), NSFont.systemFontOfSize_(15), placeholder="任意", default=default_next_next)
+    field_session  = _input_field(NSMakeRect(X + 230, 112, 56, 26), NSFont.systemFontOfSize_(15), default=str(current_interval))
     cv.addSubview_(field_next)
     cv.addSubview_(field_next_next)
-    cv.addSubview_(_label("自分へのメッセージ", NSMakeRect(20, 82, W-40, 16), NSFont.systemFontOfSize_(12)))
-    field_msg = _input_field(
-        NSMakeRect(20, 56, W - 40, 24),
-        NSFont.systemFontOfSize_(14),
-        placeholder="例: 焦らず1行だけ進める",
-        default=current_message,
-    )
+    cv.addSubview_(field_session)
+
+    cv.addSubview_(_label("サムからのメッセージ", NSMakeRect(X + 20, 90, W - X - 40, 16), NSFont.systemFontOfSize_(12)))
+    field_msg = _input_field(NSMakeRect(X + 20, 64, W - X - 40, 24), NSFont.systemFontOfSize_(14),
+                             placeholder="例: 焦らず1行だけ進める", default=current_message)
     cv.addSubview_(field_msg)
-    err = _label("", NSMakeRect(20, 36, W-40, 16), NSFont.systemFontOfSize_(12), color=NSColor.systemOrangeColor())
+    err = _label("", NSMakeRect(X + 20, 44, W - X - 40, 16), NSFont.systemFontOfSize_(12), color=NSColor.systemOrangeColor())
     cv.addSubview_(err)
 
     # ── ボタン ──────────────────────────────────────────────────────────────
-    _btn(cv, "スタート！",                _BTN1, NSMakeRect(W-160, 8, 140, 28), primary=True)
-    _btn(cv, f"☕  {BREAK_MINUTES}分休憩", _BTN2, NSMakeRect(W-312, 8, 140, 28))
-    _btn(cv, "📝 細分タスク編集",          _BTN3, NSMakeRect(20, 8, 128, 28))
+    _btn(cv, "スタート！",                _BTN1, NSMakeRect(W - 160, 8, 140, 28), primary=True)
+    _btn(cv, f"☕  {BREAK_MINUTES}分休憩", _BTN2, NSMakeRect(W - 312, 8, 140, 28))
+    _btn(cv, "📝 細分タスク編集",          _BTN3, NSMakeRect(X + 20, 8, 128, 28))
 
     win.setInitialFirstResponder_(field_next)
     _show(win)
@@ -565,28 +735,39 @@ def show_checkin(
         while True:
             resp = NSApp.runModalForWindow_(win)
             updated_today = [
-                {"text": item["text"], "done": checkboxes[i].state() != 0}
-                for i, item in enumerate(today_items)
+                {"text": item["text"], "done": bool(item.get("done", False))}
+                for item in today_model.items
+                if (item.get("text") or "").strip()
             ]
             if resp in (_CANCEL, _BTN2):
-                return "break", None, None, None, updated_today
+                return "break", None, None, None, None, updated_today
             if resp == _BTN3:
-                return "edit_today", None, None, None, updated_today
+                return "edit_today", None, None, None, None, updated_today
 
             if not today_items:
                 err.setStringValue_("先に細分タスクを追加してください")
                 continue
 
-            next_task = _parse_task_index(field_next.stringValue(), today_items)
+            next_task      = _parse_task_index(field_next.stringValue(), today_items)
             next_next_task = _parse_task_index(field_next_next.stringValue(), today_items)
             msg = field_msg.stringValue().strip()
+
+            try:
+                sv = int(field_session.stringValue().strip())
+                if not (1 <= sv <= 120):
+                    raise ValueError
+                session_mins = sv
+            except ValueError:
+                err.setStringValue_("セッション時間は1〜120の数字で入力してください")
+                continue
+
             if not next_task:
                 err.setStringValue_("次のセッションの番号を入力してください")
                 continue
             if field_next_next.stringValue().strip() and not next_next_task:
                 err.setStringValue_("その次の番号が不正です")
                 continue
-            return "start", next_task, next_next_task, msg, updated_today
+            return "start", next_task, next_next_task, msg, session_mins, updated_today
     finally:
         win.orderOut_(None)
         _hide()
@@ -613,6 +794,49 @@ def show_feedback(task: str) -> str:
 
 
 # ── Notification ──────────────────────────────────────────────────────────────
+
+
+def show_history(history: list) -> None:
+    """Read-only viewer for past daily task records."""
+    W, H = 480, 520
+    win = _make_win("過去の記録", W, H)
+    cv = win.contentView()
+
+    cv.addSubview_(_label(
+        "過去の記録",
+        NSMakeRect(20, H - 40, W - 40, 24),
+        NSFont.boldSystemFontOfSize_(15),
+        color=NSColor.colorWithWhite_alpha_(0.15, 1.0),
+    ))
+
+    lines: list[str] = []
+    for entry in reversed(history):
+        date = entry.get("date", "")
+        tasks = entry.get("tasks", [])
+        done_count = sum(1 for t in tasks if t.get("done"))
+        lines.append(f"─── {date}  ({done_count}/{len(tasks)} 完了) ───")
+        if tasks:
+            for task in tasks:
+                mark = "✅" if task.get("done") else "☐"
+                lines.append(f"  {mark}  {task.get('text', '')}")
+        else:
+            lines.append("  (タスクなし)")
+        lines.append("")
+
+    if not lines:
+        lines = ["まだ記録がありません。"]
+
+    scroll, tv = _text_view(lines, NSMakeRect(20, 52, W - 40, H - 108))
+    tv.setEditable_(False)
+    cv.addSubview_(scroll)
+
+    _btn(cv, "閉じる", _BTN1, NSMakeRect(W - 136, 12, 116, 32), primary=True)
+    _show(win)
+    try:
+        NSApp.runModalForWindow_(win)
+    finally:
+        win.orderOut_(None)
+        _hide()
 
 
 def notify(title: str, subtitle: str, body: str = ""):
@@ -647,8 +871,10 @@ class ProgressChecker(rumps.App):
             rumps.MenuItem("🌟 長期目標を変更",        callback=self._cmd_edit_long),
             rumps.MenuItem("📅 中期目標を変更",        callback=self._cmd_edit_mid),
             rumps.MenuItem("📌 短期目標を変更",        callback=self._cmd_edit_short),
-            rumps.MenuItem("📋 今週の目標を変更",      callback=self._cmd_edit_weekly),
+            rumps.MenuItem("📋 今週の計画を変更",        callback=self._cmd_edit_weekly),
             rumps.MenuItem("🗓  今日の目標を変更",      callback=self._cmd_edit_today),
+            None,
+            rumps.MenuItem("📜 過去の記録を見る",        callback=self._cmd_show_history),
             None,
             rumps.MenuItem("❌ 終了", callback=rumps.quit_application),
         ]
@@ -658,6 +884,8 @@ class ProgressChecker(rumps.App):
         self._install_edit_shortcuts()
         self._apply_app_icon()
         self._refresh_ui()
+        self._check_date_change()
+        self._check_week_change()
 
         if not self.data["goals"].get("short"):
             rumps.Timer(self._first_run, 1).start()
@@ -672,24 +900,31 @@ class ProgressChecker(rumps.App):
                 with open(DATA_FILE) as f:
                     data = json.load(f)
                 g = data.setdefault("goals", {})
-                for key in ("long", "mid", "short", "weekly"):
+                for key in ("long", "mid", "short"):
                     g.setdefault(key, "")
+                g["weekly"] = _normalize_weekly(g.get("weekly", ""))
                 g["today"] = _normalize_today(g.get("today", []))
                 data.setdefault("next_task", "")
                 data.setdefault("next_next_task", "")
                 data.setdefault("current_message", "")
                 data.setdefault("today_date", datetime.now().strftime("%Y-%m-%d"))
+                data.setdefault("history", [])
                 return data
             except Exception:
                 pass
         return {
-            "goals": {"long": "", "mid": "", "short": "", "weekly": "", "today": []},
+            "goals": {
+                "long": "", "mid": "", "short": "",
+                "weekly": {"goal": "", "week_start": "", "days": {k: [] for k in WEEKDAY_NAMES}},
+                "today": [],
+            },
             "current_task": "",
             "next_task": "",
             "next_next_task": "",
             "current_message": "",
             "interval_minutes": DEFAULT_INTERVAL,
             "today_date": datetime.now().strftime("%Y-%m-%d"),
+            "history": [],
         }
 
     def _save(self):
@@ -803,25 +1038,89 @@ class ProgressChecker(rumps.App):
             self._do_checkin()
             return
         self._check_date_change()
+        self._check_week_change()
+
+    def _add_to_history(self, date: str, tasks: list):
+        if not date or not tasks:
+            return
+        history = self.data.setdefault("history", [])
+        for entry in history:
+            if entry.get("date") == date:
+                entry["tasks"] = [dict(t) for t in tasks]
+                return
+        history.append({"date": date, "tasks": [dict(t) for t in tasks]})
 
     def _check_date_change(self):
         today_str = datetime.now().strftime("%Y-%m-%d")
         if self.data.get("today_date") == today_str:
             return
-        # Date rolled over: reset checkboxes and prompt for new goals
+        # Save current day's tasks to history
+        old_date = self.data.get("today_date", "")
+        old_tasks = _normalize_today(self.data["goals"].get("today", []))
+        self._add_to_history(old_date, old_tasks)
+        # Carry over undone tasks from the previous day
+        carryover = [{"text": t["text"], "done": False}
+                     for t in old_tasks if not t.get("done")]
+        carryover_texts = {t["text"] for t in carryover}
+        # Add today's weekday tasks from the weekly plan (skip duplicates)
+        today_dt = datetime.strptime(today_str, "%Y-%m-%d")
+        weekday_key = WEEKDAY_NAMES[today_dt.weekday()]
+        weekly = _normalize_weekly(self.data["goals"].get("weekly", {}))
+        scheduled = [
+            {"text": text, "done": False}
+            for text in weekly["days"].get(weekday_key, [])
+            if text not in carryover_texts
+        ]
         self.data["today_date"] = today_str
-        for item in self.data["goals"].get("today", []):
-            if isinstance(item, dict):
-                item["done"] = False
+        self.data["goals"]["today"] = scheduled + carryover
         self._save()
+        self._check_week_change()
         if not self._checkin_active:
             rumps.Timer(self._prompt_new_day, 2).start()
+
+    def _check_week_change(self):
+        today_str = self.data.get("today_date", datetime.now().strftime("%Y-%m-%d"))
+        try:
+            today_dt = datetime.strptime(today_str, "%Y-%m-%d")
+        except ValueError:
+            return
+        current_week_start = _monday_of(today_dt).strftime("%Y-%m-%d")
+        weekly = _normalize_weekly(self.data["goals"].get("weekly", {}))
+        if weekly.get("week_start") == current_week_start:
+            return
+        # Week changed: update week_start and prompt
+        weekly["week_start"] = current_week_start
+        self.data["goals"]["weekly"] = weekly
+        self._save()
+        if not self._checkin_active:
+            rumps.Timer(self._prompt_new_week, 3).start()
+
+    def _prompt_new_week(self, timer: rumps.Timer):
+        timer.stop()
+        if self._checkin_active:
+            return
+        notify("📅 新しい週が始まりました！", "今週の計画を立てましょう")
+        self._edit_weekly()
+        # After setting weekly plan, reload today's tasks
+        today_str = self.data.get("today_date", datetime.now().strftime("%Y-%m-%d"))
+        try:
+            today_dt = datetime.strptime(today_str, "%Y-%m-%d")
+        except ValueError:
+            return
+        weekday_key = WEEKDAY_NAMES[today_dt.weekday()]
+        weekly = _normalize_weekly(self.data["goals"].get("weekly", {}))
+        scheduled = [{"text": t, "done": False} for t in weekly["days"].get(weekday_key, [])]
+        existing_texts = {t["text"] for t in self.data["goals"].get("today", [])}
+        for task in scheduled:
+            if task["text"] not in existing_texts:
+                self.data["goals"].setdefault("today", []).append(task)
+        self._save()
 
     def _prompt_new_day(self, timer: rumps.Timer):
         timer.stop()
         if self._checkin_active:
             return
-        notify("🌅 新しい日が始まりました！", "今日の目標を更新しましょう")
+        notify("🌅 新しい日が始まりました！", "今日のタスクを追加しましょう")
         self._edit_today()
 
     # ── Core flows ────────────────────────────────────────────────────────
@@ -835,24 +1134,39 @@ class ProgressChecker(rumps.App):
         try:
             g = self.data["goals"]
             str_entries = [
-                ("long",   "長期目標 (1/5)", "1〜2年後に達成したいことは？"),
-                ("mid",    "中期目標 (2/5)", "1〜5ヶ月で達成したいことは？"),
-                ("short",  "短期目標 (3/5)", "今日〜1ヶ月で達成したいことは？"),
-                ("weekly", "今週の目標 (4/5)", "今週やりたいことは？"),
+                ("long",  "長期目標 (1/4)", "1〜2年後に達成したいことは？"),
+                ("mid",   "中期目標 (2/4)", "1〜5ヶ月で達成したいことは？"),
+                ("short", "短期目標 (3/4)", "今日〜1ヶ月で達成したいことは？"),
             ]
-            updated: dict = {k: g.get(k, "") for k in ("long", "mid", "short", "weekly")}
+            updated: dict = {k: g.get(k, "") for k in ("long", "mid", "short")}
             for key, title, prompt in str_entries:
                 val = show_goal_input(title, prompt, default=g.get(key, ""))
                 if val is not None:
                     updated[key] = val
 
-            today_texts = [item["text"] for item in _normalize_today(g.get("today", []))]
-            val = show_list_input("今日の目標 (5/5)", "今日やりたいことは？", today_texts)
-            if val is not None:
-                old_done = {item["text"]: item["done"] for item in _normalize_today(g.get("today", []))}
-                updated["today"] = [{"text": t, "done": old_done.get(t, False)} for t in val]
-            else:
-                updated["today"] = _normalize_today(g.get("today", []))
+            # Weekly plan (4/4): goal + per-day tasks
+            weekly = _normalize_weekly(g.get("weekly", {}))
+            weekly_result = show_weekly_editor(weekly["goal"], weekly["days"], weekly.get("week_start", ""))
+            if weekly_result is not None:
+                weekly["goal"] = weekly_result["goal"]
+                weekly["days"] = weekly_result["days"]
+            today_str = self.data.get("today_date", datetime.now().strftime("%Y-%m-%d"))
+            weekly["week_start"] = _monday_of(datetime.strptime(today_str, "%Y-%m-%d")).strftime("%Y-%m-%d")
+            updated["weekly"] = weekly
+
+            # Today's tasks: seed from weekly plan for today's weekday
+            today_dt = datetime.strptime(today_str, "%Y-%m-%d")
+            weekday_key = WEEKDAY_NAMES[today_dt.weekday()]
+            scheduled = [{"text": t, "done": False} for t in weekly["days"].get(weekday_key, [])]
+            old_today = _normalize_today(g.get("today", []))
+            old_done = {t["text"]: t["done"] for t in old_today}
+            merged = {t["text"]: t for t in scheduled}
+            for t in old_today:
+                if t["text"] not in merged:
+                    merged[t["text"]] = t
+                else:
+                    merged[t["text"]]["done"] = old_done.get(t["text"], False)
+            updated["today"] = list(merged.values())
 
             self.data["goals"] = updated
             self._save()
@@ -907,12 +1221,14 @@ class ProgressChecker(rumps.App):
                 notify("🔄 賢い判断！", "難しすぎたのかも", "もっと小さなタスクに分けてみよう 💡")
 
         while True:
-            action, new_task, queued_next_task, message, updated_today = show_checkin(
+            action, new_task, queued_next_task, message, session_mins, updated_today = show_checkin(
                 self.data["goals"],
+                today_date=self.data.get("today_date", ""),
                 current_task=self.data.get("current_task", ""),
                 queued_task=self.data.get("next_task", ""),
                 queued_next_task=self.data.get("next_next_task", ""),
                 current_message=self.data.get("current_message", ""),
+                current_interval=self.data.get("interval_minutes", DEFAULT_INTERVAL),
             )
 
             # Save checkbox state regardless of which button was pressed
@@ -940,6 +1256,8 @@ class ProgressChecker(rumps.App):
         self.data["next_task"] = queued_next_task or ""
         self.data["next_next_task"] = ""
         self.data["current_message"] = message or ""
+        if session_mins is not None:
+            self.data["interval_minutes"] = session_mins
         self._save()
         self._reset_timer()
         self._refresh_ui()
@@ -974,10 +1292,34 @@ class ProgressChecker(rumps.App):
         self._edit_goal("short", "短期目標を変更", "今日〜1ヶ月で達成したいことは？")
 
     def _cmd_edit_weekly(self, _):
-        self._edit_goal("weekly", "今週の目標を変更", "今週やりたいことは？")
+        self._edit_weekly()
+
+    def _edit_weekly(self):
+        if self._checkin_active:
+            return
+        self._checkin_active = True
+        try:
+            weekly = _normalize_weekly(self.data["goals"].get("weekly", {}))
+            result = show_weekly_editor(weekly["goal"], weekly["days"], weekly.get("week_start", ""))
+            if result is not None:
+                weekly["goal"] = result["goal"]
+                weekly["days"] = result["days"]
+                self.data["goals"]["weekly"] = weekly
+                self._save()
+        finally:
+            self._checkin_active = False
 
     def _cmd_edit_today(self, _):
         self._edit_today()
+
+    def _cmd_show_history(self, _):
+        if self._checkin_active:
+            return
+        self._checkin_active = True
+        try:
+            show_history(self.data.get("history", []))
+        finally:
+            self._checkin_active = False
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
