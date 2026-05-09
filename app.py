@@ -626,22 +626,14 @@ def show_checkin(
             iv.setImageAlignment_(5)  # NSImageAlignBottom
             cv.addSubview_(iv)
 
-    # Try cards stacked from window top downward
+    # Try items stacked from window top downward — plain style, padded blocks
     for _ti, _try_text in enumerate(active_tries):
         _card_y = H - _TOP_PAD - (_ti + 1) * _BLOCK_H - _ti * _BLOCK_GAP
-        _card = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(_LX, _card_y, X - _LX * 2, _BLOCK_H)
-        )
-        _card.setStringValue_(_try_text)
-        _card.setFont_(NSFont.boldSystemFontOfSize_(14))
-        _card.setTextColor_(NSColor.colorWithWhite_alpha_(0.15, 1.0))
-        _card.setBezeled_(False)
-        _card.setDrawsBackground_(True)
-        _card.setBackgroundColor_(NSColor.colorWithWhite_alpha_(0.91, 1.0))
-        _card.setEditable_(False)
-        _card.setSelectable_(False)
-        _card.cell().setWraps_(True)
-        cv.addSubview_(_card)
+        cv.addSubview_(_mlabel(
+            _try_text,
+            NSMakeRect(_LX, _card_y, X - _LX * 2, _BLOCK_H),
+            NSFont.systemFontOfSize_(13),
+        ))
 
     # ── 今日やりたいこと（ドラッグで並び替え可）──────────────────────────────
     cv.addSubview_(_label(
