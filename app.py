@@ -594,8 +594,13 @@ def show_checkin(
     ITEM_H = 22       # NSTableView row height
     MAX_VIS = 5       # max rows before scroll kicks in
     GAP = 6
-    # Fixed bottom ends at y=494; today section floats above it.
-    FIXED_BOTTOM = 494
+    # Try section height — grows with item count (max 3 visible, scrollable beyond)
+    _TRY_LINE_H = 18
+    _TRY_MAX_VIS = 3
+    _try_n = len(active_tries)
+    _try_scroll_h = max(_TRY_LINE_H, min(max(_try_n, 1), _TRY_MAX_VIS) * _TRY_LINE_H)
+    _try_label_y = 432 + _try_scroll_h + 4  # 428(bottom sep)+4(gap)+scroll_h+4(gap)
+    FIXED_BOTTOM = _try_label_y + 16 + 4    # label(16) + top gap(4)
     items_bottom_y = FIXED_BOTTOM + GAP
     items_section_h = min(max(n, 1), MAX_VIS) * ITEM_H if n else 22
     today_label_y = items_bottom_y + items_section_h + GAP
@@ -664,19 +669,17 @@ def show_checkin(
 
     cv.addSubview_(_sep(NSMakeRect(X + 20, FIXED_BOTTOM, W - X - 40, 1)))
 
-    # ── 前日のTry ─────────────────────────────────────────────────────────────
+    # ── Try ──────────────────────────────────────────────────────────────────
     cv.addSubview_(_label(
-        "📝  前日のTry",
-        NSMakeRect(X + 20, 474, W - X - 40, 16),
+        "📝  Try",
+        NSMakeRect(X + 20, _try_label_y, W - X - 40, 16),
         NSFont.boldSystemFontOfSize_(13),
     ))
-    _try_disp = "\n".join(f"・{t}" for t in active_tries) if active_tries else "（なし）"
-    cv.addSubview_(_mlabel(
-        _try_disp,
-        NSMakeRect(X + 28, 432, W - X - 48, 40),
-        NSFont.systemFontOfSize_(12),
-        color=NSColor.colorWithWhite_alpha_(0.3, 1.0),
-    ))
+    _try_items_disp = [f"・{t}" for t in active_tries] if active_tries else ["（なし）"]
+    _try_sv, _try_tv = _text_view(_try_items_disp, NSMakeRect(X + 24, 432, W - X - 44, _try_scroll_h))
+    _try_tv.setEditable_(False)
+    _try_tv.setFont_(NSFont.systemFontOfSize_(12))
+    cv.addSubview_(_try_sv)
     cv.addSubview_(_sep(NSMakeRect(X + 20, 428, W - X - 40, 1)))
 
     # ── 今週（目標 + 曜日別タスク一覧）──────────────────────────────────────
@@ -921,35 +924,74 @@ def show_kpt_editor(keep: list, problem: list, try_: list) -> Optional[dict]:
 
 
 def show_try_selector(try_items: list) -> list:
-    """Checkbox dialog to select which Try items to carry forward. Returns selected items."""
+    """Checkbox + drag-and-drop dialog for selecting and reordering Try items to carry forward."""
     if not try_items:
         return []
     n = len(try_items)
-    W = 440
-    H = max(160, 100 + n * 30)
+    W = 460
+    ITEM_H = 24
+    MAX_VIS = 6
+    table_h = min(n, MAX_VIS) * ITEM_H
+    H = max(180, table_h + 110)
+
     win = _make_win("明日に持ち越すTryを選ぶ", W, H)
     cv = win.contentView()
     cv.addSubview_(_label(
-        "チェックインに表示するTryを選んでください",
+        "持ち越すTryを選択・並び替え",
         NSMakeRect(20, H - 34, W - 40, 22), NSFont.boldSystemFontOfSize_(13),
     ))
-    checkboxes = []
-    for i, item in enumerate(try_items):
-        y = H - 66 - i * 30
-        cb = NSButton.alloc().initWithFrame_(NSMakeRect(20, y, W - 40, 26))
-        cb.setButtonType_(3)  # NSSwitchButton (checkbox)
-        cb.setTitle_(item)
-        cb.setFont_(NSFont.systemFontOfSize_(13))
-        cb.setState_(1)  # checked by default
-        cv.addSubview_(cb)
-        checkboxes.append(cb)
+    cv.addSubview_(_label(
+        "チェックで選択、ドラッグで順番を変更",
+        NSMakeRect(20, H - 54, W - 40, 16),
+        NSFont.systemFontOfSize_(11), color=NSColor.colorWithWhite_alpha_(0.5, 1.0),
+    ))
+
+    items = [{"text": t, "done": True} for t in try_items]
+    model = _TodayTaskTableModel.alloc().initWithItems_(items)
+
+    scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(20, 52, W - 40, table_h))
+    scroll.setHasVerticalScroller_(n > MAX_VIS)
+    scroll.setAutohidesScrollers_(True)
+    scroll.setBorderType_(2)
+
+    table_w = W - 56
+    table = NSTableView.alloc().initWithFrame_(NSMakeRect(0, 0, table_w, table_h))
+    table.setRowHeight_(float(ITEM_H - 2))
+
+    done_col = NSTableColumn.alloc().initWithIdentifier_("done")
+    done_col.setWidth_(22)
+    done_col.setEditable_(True)
+    bcell = NSButtonCell.alloc().init()
+    bcell.setButtonType_(3)
+    bcell.setTitle_("")
+    bcell.setControlSize_(1)
+    done_col.setDataCell_(bcell)
+    table.addTableColumn_(done_col)
+
+    task_col = NSTableColumn.alloc().initWithIdentifier_("task")
+    task_col.setWidth_(table_w - 22 - 4)
+    task_col.setEditable_(False)
+    task_col.dataCell().setFont_(NSFont.systemFontOfSize_(13))
+    table.addTableColumn_(task_col)
+
+    table.setHeaderView_(None)
+    table.setUsesAlternatingRowBackgroundColors_(True)
+    table.setAllowsMultipleSelection_(False)
+    table.setAllowsEmptySelection_(True)
+    table.setDataSource_(model)
+    table.setDelegate_(model)
+    table.setDraggingSourceOperationMask_forLocal_(2, True)
+    table.registerForDraggedTypes_([NSPasteboardTypeString])
+    scroll.setDocumentView_(table)
+    cv.addSubview_(scroll)
+
     _btn(cv, "決定", _BTN1, NSMakeRect(W - 136, 12, 116, 32), primary=True)
     _show(win)
     try:
         resp = NSApp.runModalForWindow_(win)
         if resp == _CANCEL:
             return []
-        return [try_items[i] for i, cb in enumerate(checkboxes) if cb.state() == 1]
+        return [item["text"] for item in model.items if item.get("done")]
     finally:
         win.orderOut_(None)
         _hide()
