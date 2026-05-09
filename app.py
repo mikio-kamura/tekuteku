@@ -578,9 +578,11 @@ def show_checkin(
     queued_next_task: str = "",
     current_message: str = "",
     current_interval: int = DEFAULT_INTERVAL,
+    active_tries: Optional[list] = None,
 ) -> tuple[str, Optional[str], Optional[str], Optional[str], Optional[int], list]:
     """Returns (action, next_task, next_next_task, message, session_minutes, updated_today_items).
     action is one of: start, break, edit_today."""
+    active_tries = active_tries or []
     today_items = _normalize_today(goals.get("today", []))
     try:
         _today_dt = datetime.strptime(today_date, "%Y-%m-%d") if today_date else datetime.now()
@@ -592,8 +594,8 @@ def show_checkin(
     ITEM_H = 22       # NSTableView row height
     MAX_VIS = 5       # max rows before scroll kicks in
     GAP = 6
-    # Fixed bottom ends at y=428; today section floats above it.
-    FIXED_BOTTOM = 428
+    # Fixed bottom ends at y=494; today section floats above it.
+    FIXED_BOTTOM = 494
     items_bottom_y = FIXED_BOTTOM + GAP
     items_section_h = min(max(n, 1), MAX_VIS) * ITEM_H if n else 22
     today_label_y = items_bottom_y + items_section_h + GAP
@@ -661,6 +663,21 @@ def show_checkin(
         cv.addSubview_(_mlabel("未設定（📝ボタンで追加）", NSMakeRect(X + 28, items_bottom_y + 2, W - X - 48, 18), NSFont.systemFontOfSize_(13)))
 
     cv.addSubview_(_sep(NSMakeRect(X + 20, FIXED_BOTTOM, W - X - 40, 1)))
+
+    # ── 前日のTry ─────────────────────────────────────────────────────────────
+    cv.addSubview_(_label(
+        "📝  前日のTry",
+        NSMakeRect(X + 20, 474, W - X - 40, 16),
+        NSFont.boldSystemFontOfSize_(13),
+    ))
+    _try_disp = "\n".join(f"・{t}" for t in active_tries) if active_tries else "（なし）"
+    cv.addSubview_(_mlabel(
+        _try_disp,
+        NSMakeRect(X + 28, 432, W - X - 48, 40),
+        NSFont.systemFontOfSize_(12),
+        color=NSColor.colorWithWhite_alpha_(0.3, 1.0),
+    ))
+    cv.addSubview_(_sep(NSMakeRect(X + 20, 428, W - X - 40, 1)))
 
     # ── 今週（目標 + 曜日別タスク一覧）──────────────────────────────────────
     _weekly = goals.get("weekly", {})
@@ -855,6 +872,126 @@ def show_history(history: list) -> None:
         _hide()
 
 
+def show_kpt_editor(keep: list, problem: list, try_: list) -> Optional[dict]:
+    """KPT retrospective editor.
+    Returns {"keep": [...], "problem": [...], "try": [...]} or None."""
+    W, H = 580, 520
+    win = _make_win("今日の振り返り（KPT）", W, H)
+    cv = win.contentView()
+
+    cv.addSubview_(_label("今日の振り返り（KPT）", NSMakeRect(20, H - 34, W - 40, 22), NSFont.boldSystemFontOfSize_(13)))
+    cv.addSubview_(_label(
+        "1行に1つ入力してください",
+        NSMakeRect(20, H - 54, W - 40, 16),
+        NSFont.systemFontOfSize_(11), color=NSColor.colorWithWhite_alpha_(0.5, 1.0),
+    ))
+
+    col_w = (W - 60) // 3  # ≈ 173
+    headers = [
+        ("✅ Keep",    "うまくいったこと", keep),
+        ("⚠️ Problem", "改善できること",   problem),
+        ("🚀 Try",     "次に試すこと",     try_),
+    ]
+    text_views = []
+    for idx, (title, subtitle, items) in enumerate(headers):
+        x = 20 + idx * (col_w + 10)
+        cv.addSubview_(_label(title, NSMakeRect(x, H - 76, col_w, 18), NSFont.boldSystemFontOfSize_(12)))
+        cv.addSubview_(_label(
+            subtitle, NSMakeRect(x, H - 96, col_w, 16),
+            NSFont.systemFontOfSize_(11), color=NSColor.colorWithWhite_alpha_(0.5, 1.0),
+        ))
+        scroll, tv = _text_view(items, NSMakeRect(x, 52, col_w, H - 152))
+        tv.setFont_(NSFont.systemFontOfSize_(13))
+        cv.addSubview_(scroll)
+        text_views.append(tv)
+
+    _btn(cv, "決定", _BTN1, NSMakeRect(W - 136, 12, 116, 32), primary=True)
+    win.makeFirstResponder_(text_views[0])
+    _show(win)
+    try:
+        resp = NSApp.runModalForWindow_(win)
+        if resp == _CANCEL:
+            return None
+        def _parse(tv):
+            return [l.strip() for l in str(tv.string()).split("\n") if l.strip()]
+        return {"keep": _parse(text_views[0]), "problem": _parse(text_views[1]), "try": _parse(text_views[2])}
+    finally:
+        win.orderOut_(None)
+        _hide()
+
+
+def show_try_selector(try_items: list) -> list:
+    """Checkbox dialog to select which Try items to carry forward. Returns selected items."""
+    if not try_items:
+        return []
+    n = len(try_items)
+    W = 440
+    H = max(160, 100 + n * 30)
+    win = _make_win("明日に持ち越すTryを選ぶ", W, H)
+    cv = win.contentView()
+    cv.addSubview_(_label(
+        "チェックインに表示するTryを選んでください",
+        NSMakeRect(20, H - 34, W - 40, 22), NSFont.boldSystemFontOfSize_(13),
+    ))
+    checkboxes = []
+    for i, item in enumerate(try_items):
+        y = H - 66 - i * 30
+        cb = NSButton.alloc().initWithFrame_(NSMakeRect(20, y, W - 40, 26))
+        cb.setButtonType_(3)  # NSSwitchButton (checkbox)
+        cb.setTitle_(item)
+        cb.setFont_(NSFont.systemFontOfSize_(13))
+        cb.setState_(1)  # checked by default
+        cv.addSubview_(cb)
+        checkboxes.append(cb)
+    _btn(cv, "決定", _BTN1, NSMakeRect(W - 136, 12, 116, 32), primary=True)
+    _show(win)
+    try:
+        resp = NSApp.runModalForWindow_(win)
+        if resp == _CANCEL:
+            return []
+        return [try_items[i] for i, cb in enumerate(checkboxes) if cb.state() == 1]
+    finally:
+        win.orderOut_(None)
+        _hide()
+
+
+def show_kpt_history(kpt_history: list) -> None:
+    """Read-only viewer for past KPT retrospective records."""
+    W, H = 520, 560
+    win = _make_win("過去の振り返り記録", W, H)
+    cv = win.contentView()
+    cv.addSubview_(_label(
+        "過去の振り返り記録",
+        NSMakeRect(20, H - 40, W - 40, 24),
+        NSFont.boldSystemFontOfSize_(15),
+        color=NSColor.colorWithWhite_alpha_(0.15, 1.0),
+    ))
+    lines: list[str] = []
+    for entry in reversed(kpt_history):
+        date = entry.get("date", "")
+        lines.append(f"─── {date} ───")
+        for section, label in (("keep", "✅ Keep"), ("problem", "⚠️ Problem"), ("try", "🚀 Try")):
+            lines.append(label)
+            items = entry.get(section, [])
+            for item in items:
+                lines.append(f"  • {item}")
+            if not items:
+                lines.append("  （なし）")
+        lines.append("")
+    if not lines:
+        lines = ["まだ振り返り記録がありません。"]
+    scroll, tv = _text_view(lines, NSMakeRect(20, 52, W - 40, H - 108))
+    tv.setEditable_(False)
+    cv.addSubview_(scroll)
+    _btn(cv, "閉じる", _BTN1, NSMakeRect(W - 136, 12, 116, 32), primary=True)
+    _show(win)
+    try:
+        NSApp.runModalForWindow_(win)
+    finally:
+        win.orderOut_(None)
+        _hide()
+
+
 def notify(title: str, subtitle: str, body: str = ""):
     try:
         rumps.notification(title, subtitle, body)
@@ -896,7 +1033,10 @@ class ProgressChecker(rumps.App):
             rumps.MenuItem("📋 今週の計画を変更",        callback=self._cmd_edit_weekly),
             rumps.MenuItem("🗓  今日の目標を変更",      callback=self._cmd_edit_today),
             None,
-            rumps.MenuItem("📜 過去の記録を見る",        callback=self._cmd_show_history),
+            rumps.MenuItem("📜 過去の記録を見る",         callback=self._cmd_show_history),
+            None,
+            rumps.MenuItem("📝 今日の振り返り（KPT）",    callback=self._cmd_do_retrospective),
+            rumps.MenuItem("📊 過去の振り返りを見る",      callback=self._cmd_show_kpt_history),
             None,
             rumps.MenuItem("❌ 終了", callback=rumps.quit_application),
         ]
@@ -931,6 +1071,9 @@ class ProgressChecker(rumps.App):
                 data.setdefault("current_message", "")
                 data.setdefault("sam_messages", [])
                 data.setdefault("sam_message", "")
+                data.setdefault("kpt", {"date": "", "keep": [], "problem": [], "try": []})
+                data.setdefault("kpt_history", [])
+                data.setdefault("active_tries", [])
                 data.setdefault("today_date", datetime.now().strftime("%Y-%m-%d"))
                 data.setdefault("history", [])
                 return data
@@ -948,6 +1091,9 @@ class ProgressChecker(rumps.App):
             "current_message": "",
             "sam_messages": [],
             "sam_message": "",
+            "kpt": {"date": "", "keep": [], "problem": [], "try": []},
+            "kpt_history": [],
+            "active_tries": [],
             "interval_minutes": DEFAULT_INTERVAL,
             "today_date": datetime.now().strftime("%Y-%m-%d"),
             "history": [],
@@ -1261,6 +1407,7 @@ class ProgressChecker(rumps.App):
                 queued_next_task=self.data.get("next_next_task", ""),
                 current_message=self.data.get("current_message", ""),
                 current_interval=self.data.get("interval_minutes", DEFAULT_INTERVAL),
+                active_tries=self.data.get("active_tries", []),
             )
 
             # Save checkbox state regardless of which button was pressed
@@ -1444,6 +1591,45 @@ class ProgressChecker(rumps.App):
         self._checkin_active = True
         try:
             show_history(self.data.get("history", []))
+        finally:
+            self._checkin_active = False
+
+    def _cmd_do_retrospective(self, _):
+        if self._checkin_active:
+            return
+        self._checkin_active = True
+        try:
+            kpt = self.data.get("kpt", {})
+            result = show_kpt_editor(
+                kpt.get("keep", []),
+                kpt.get("problem", []),
+                kpt.get("try", []),
+            )
+            if result is None:
+                return
+            result["date"] = self.data.get("today_date", datetime.now().strftime("%Y-%m-%d"))
+            self.data["kpt"] = result
+            # Upsert into kpt_history
+            history = self.data.setdefault("kpt_history", [])
+            for i, entry in enumerate(history):
+                if entry.get("date") == result["date"]:
+                    history[i] = dict(result)
+                    break
+            else:
+                history.append(dict(result))
+            # Ask which Try items to carry forward to tomorrow's check-ins
+            selected = show_try_selector(result.get("try", []))
+            self.data["active_tries"] = selected
+            self._save()
+        finally:
+            self._checkin_active = False
+
+    def _cmd_show_kpt_history(self, _):
+        if self._checkin_active:
+            return
+        self._checkin_active = True
+        try:
+            show_kpt_history(self.data.get("kpt_history", []))
         finally:
             self._checkin_active = False
 
