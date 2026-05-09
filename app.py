@@ -594,13 +594,7 @@ def show_checkin(
     ITEM_H = 22       # NSTableView row height
     MAX_VIS = 5       # max rows before scroll kicks in
     GAP = 6
-    # Try section height — grows with item count (max 3 visible, scrollable beyond)
-    _TRY_LINE_H = 18
-    _TRY_MAX_VIS = 3
-    _try_n = len(active_tries)
-    _try_scroll_h = max(_TRY_LINE_H, min(max(_try_n, 1), _TRY_MAX_VIS) * _TRY_LINE_H)
-    _try_label_y = 432 + _try_scroll_h + 4  # 428(bottom sep)+4(gap)+scroll_h+4(gap)
-    FIXED_BOTTOM = _try_label_y + 16 + 4    # label(16) + top gap(4)
+    FIXED_BOTTOM = 428
     items_bottom_y = FIXED_BOTTOM + GAP
     items_section_h = min(max(n, 1), MAX_VIS) * ITEM_H if n else 22
     today_label_y = items_bottom_y + items_section_h + GAP
@@ -610,16 +604,44 @@ def show_checkin(
     win = _make_win("チェックイン", W, H)
     cv = win.contentView()
 
-    # ── キャラクター画像（左列）────────────────────────────────────────────
+    # ── 左列：Tryカード（上部）+ サム画像（下部）────────────────────────────
+    _LX = 8          # left column padding
+    _BLOCK_H = 54    # height per Try card
+    _BLOCK_GAP = 10  # gap between cards
+    _TOP_PAD = 12    # gap from window top to first card
+
+    _n_try = len(active_tries)
+    _try_col_h = (
+        _TOP_PAD + _n_try * _BLOCK_H + max(0, _n_try - 1) * _BLOCK_GAP + 8
+    ) if _n_try else 0
+
+    # Sam image fills the lower portion of the left column
+    _sam_h = H - _try_col_h - _LX
     if os.path.exists(SAM_IMG):
         _img = NSImage.alloc().initByReferencingFile_(SAM_IMG)
-        if _img:
-            _pad = 10
-            iv = NSImageView.alloc().initWithFrame_(NSMakeRect(_pad, _pad, X - _pad * 2, H - _pad))
+        if _img and _sam_h > 20:
+            iv = NSImageView.alloc().initWithFrame_(NSMakeRect(_LX, _LX, X - _LX * 2, _sam_h))
             iv.setImage_(_img)
             iv.setImageScaling_(3)   # NSImageScaleProportionallyUpOrDown
             iv.setImageAlignment_(5)  # NSImageAlignBottom
             cv.addSubview_(iv)
+
+    # Try cards stacked from window top downward
+    for _ti, _try_text in enumerate(active_tries):
+        _card_y = H - _TOP_PAD - (_ti + 1) * _BLOCK_H - _ti * _BLOCK_GAP
+        _card = NSTextField.alloc().initWithFrame_(
+            NSMakeRect(_LX, _card_y, X - _LX * 2, _BLOCK_H)
+        )
+        _card.setStringValue_(_try_text)
+        _card.setFont_(NSFont.boldSystemFontOfSize_(14))
+        _card.setTextColor_(NSColor.colorWithWhite_alpha_(0.15, 1.0))
+        _card.setBezeled_(False)
+        _card.setDrawsBackground_(True)
+        _card.setBackgroundColor_(NSColor.colorWithWhite_alpha_(0.91, 1.0))
+        _card.setEditable_(False)
+        _card.setSelectable_(False)
+        _card.cell().setWraps_(True)
+        cv.addSubview_(_card)
 
     # ── 今日やりたいこと（ドラッグで並び替え可）──────────────────────────────
     cv.addSubview_(_label(
@@ -668,19 +690,6 @@ def show_checkin(
         cv.addSubview_(_mlabel("未設定（📝ボタンで追加）", NSMakeRect(X + 28, items_bottom_y + 2, W - X - 48, 18), NSFont.systemFontOfSize_(13)))
 
     cv.addSubview_(_sep(NSMakeRect(X + 20, FIXED_BOTTOM, W - X - 40, 1)))
-
-    # ── Try ──────────────────────────────────────────────────────────────────
-    cv.addSubview_(_label(
-        "📝  Try",
-        NSMakeRect(X + 20, _try_label_y, W - X - 40, 16),
-        NSFont.boldSystemFontOfSize_(13),
-    ))
-    _try_items_disp = [f"・{t}" for t in active_tries] if active_tries else ["（なし）"]
-    _try_sv, _try_tv = _text_view(_try_items_disp, NSMakeRect(X + 24, 432, W - X - 44, _try_scroll_h))
-    _try_tv.setEditable_(False)
-    _try_tv.setFont_(NSFont.systemFontOfSize_(12))
-    cv.addSubview_(_try_sv)
-    cv.addSubview_(_sep(NSMakeRect(X + 20, 428, W - X - 40, 1)))
 
     # ── 今週（目標 + 曜日別タスク一覧）──────────────────────────────────────
     _weekly = goals.get("weekly", {})
