@@ -604,16 +604,15 @@ def show_checkin(
     win = _make_win("チェックイン", W, H)
     cv = win.contentView()
 
-    # ── 左列：Tryカード（上部）+ サム画像（下部）────────────────────────────
+    # ── 左列：Tryリスト（上部）+ サム画像（下部）────────────────────────────
     _LX = 8          # left column padding
-    _BLOCK_H = 54    # height per Try card
-    _BLOCK_GAP = 10  # gap between cards
-    _TOP_PAD = 12    # gap from window top to first card
+    _TOP_PAD = 12    # gap from window top to list
+    _ITEM_H = 34     # height per item slot (text + blank-line spacing)
+    _AFTER_GAP = 8   # gap between list and sam image
 
     _n_try = len(active_tries)
-    _try_col_h = (
-        _TOP_PAD + _n_try * _BLOCK_H + max(0, _n_try - 1) * _BLOCK_GAP + 8
-    ) if _n_try else 0
+    _list_h = min(max(_n_try, 1), 4) * _ITEM_H if _n_try else 0
+    _try_col_h = (_TOP_PAD + _list_h + _AFTER_GAP) if _n_try else 0
 
     # Sam image fills the lower portion of the left column
     _sam_h = H - _try_col_h - _LX
@@ -626,14 +625,18 @@ def show_checkin(
             iv.setImageAlignment_(5)  # NSImageAlignBottom
             cv.addSubview_(iv)
 
-    # Try items stacked from window top downward — plain style, padded blocks
-    for _ti, _try_text in enumerate(active_tries):
-        _card_y = H - _TOP_PAD - (_ti + 1) * _BLOCK_H - _ti * _BLOCK_GAP
-        cv.addSubview_(_mlabel(
-            _try_text,
-            NSMakeRect(_LX, _card_y, X - _LX * 2, _BLOCK_H),
-            NSFont.systemFontOfSize_(13),
-        ))
+    # Try list: items separated by blank lines for breathing room, scrollable if 5+
+    if active_tries:
+        _try_lines = []
+        for _ti, _t in enumerate(active_tries):
+            _try_lines.append(_t)
+            if _ti < _n_try - 1:
+                _try_lines.append("")  # blank line between items
+        _list_y = H - _TOP_PAD - _list_h
+        _try_sv, _try_tv = _text_view(_try_lines, NSMakeRect(_LX, _list_y, X - _LX * 2, _list_h))
+        _try_tv.setEditable_(False)
+        _try_tv.setFont_(NSFont.systemFontOfSize_(13))
+        cv.addSubview_(_try_sv)
 
     # ── 今日やりたいこと（ドラッグで並び替え可）──────────────────────────────
     cv.addSubview_(_label(
