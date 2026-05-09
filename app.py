@@ -604,39 +604,39 @@ def show_checkin(
     win = _make_win("チェックイン", W, H)
     cv = win.contentView()
 
-    # ── 左列：Tryリスト（上部）+ サム画像（下部）────────────────────────────
-    _LX = 8          # left column padding
-    _TOP_PAD = 12    # gap from window top to list
-    _ITEM_H = 34     # height per item slot (text + blank-line spacing)
-    _AFTER_GAP = 8   # gap between list and sam image
+    # ── 左列：サム画像（下部）+ Tryリスト（サムの真上、上部は余白）──────────
+    _LX = 8
+    _LINE_H = 18   # height per try item row
+    _ITEM_GAP = 6  # gap between items (< _LIST_PAD)
+    _LIST_PAD = 14 # padding above first and below last item (> _ITEM_GAP)
 
     _n_try = len(active_tries)
-    _list_h = min(max(_n_try, 1), 4) * _ITEM_H if _n_try else 0
-    _try_col_h = (_TOP_PAD + _list_h + _AFTER_GAP) if _n_try else 0
+    _list_content_h = (_n_try * _LINE_H + max(0, _n_try - 1) * _ITEM_GAP) if _n_try else 0
+    _try_col_h = (2 * _LIST_PAD + _list_content_h) if _n_try else 0
 
-    # Sam image fills the lower portion of the left column
-    _sam_h = H - _try_col_h - _LX
+    # Sam takes ~60% of the column; try list sits just above; top is naturally empty
+    _sam_h = min(int(H * 0.60), H - _try_col_h - _LX * 2)
+    _sam_h = max(_sam_h, 40)
+
     if os.path.exists(SAM_IMG):
         _img = NSImage.alloc().initByReferencingFile_(SAM_IMG)
-        if _img and _sam_h > 20:
+        if _img:
             iv = NSImageView.alloc().initWithFrame_(NSMakeRect(_LX, _LX, X - _LX * 2, _sam_h))
             iv.setImage_(_img)
             iv.setImageScaling_(3)   # NSImageScaleProportionallyUpOrDown
             iv.setImageAlignment_(5)  # NSImageAlignBottom
             cv.addSubview_(iv)
 
-    # Try list: items separated by blank lines for breathing room, scrollable if 5+
+    # Try bullet items anchored to Sam's top, stacked upward (i=0 → topmost)
     if active_tries:
-        _try_lines = []
-        for _ti, _t in enumerate(active_tries):
-            _try_lines.append(_t)
-            if _ti < _n_try - 1:
-                _try_lines.append("")  # blank line between items
-        _list_y = H - _TOP_PAD - _list_h
-        _try_sv, _try_tv = _text_view(_try_lines, NSMakeRect(_LX, _list_y, X - _LX * 2, _list_h))
-        _try_tv.setEditable_(False)
-        _try_tv.setFont_(NSFont.systemFontOfSize_(13))
-        cv.addSubview_(_try_sv)
+        _sam_top = _LX + _sam_h
+        for _ti, _try_text in enumerate(active_tries):
+            _item_y = _sam_top + _LIST_PAD + (_n_try - 1 - _ti) * (_LINE_H + _ITEM_GAP)
+            cv.addSubview_(_mlabel(
+                f"・{_try_text}",
+                NSMakeRect(_LX, _item_y, X - _LX * 2, _LINE_H),
+                NSFont.systemFontOfSize_(13),
+            ))
 
     # ── 今日やりたいこと（ドラッグで並び替え可）──────────────────────────────
     cv.addSubview_(_label(
