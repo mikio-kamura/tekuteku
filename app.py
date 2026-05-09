@@ -606,15 +606,18 @@ def show_checkin(
 
     # ── 左列：サム画像（下部）+ Tryリスト（サムの真上、上部は余白）──────────
     _LX = 8
-    _LINE_H = 18   # height per try item row
-    _ITEM_GAP = 6  # gap between items (< _LIST_PAD)
-    _LIST_PAD = 14 # padding above first and below last item (> _ITEM_GAP)
+    _LINE_H = 18    # height per try item row
+    _ITEM_GAP = 6   # gap between items
+    _LABEL_H = 14   # "Try" heading height
+    _LABEL_GAP = 4  # gap between heading and first item
+    _LIST_PAD = 14  # top/bottom padding of list (> _ITEM_GAP)
 
     _n_try = len(active_tries)
-    _list_content_h = (_n_try * _LINE_H + max(0, _n_try - 1) * _ITEM_GAP) if _n_try else 0
+    _list_content_h = (
+        _LABEL_H + _LABEL_GAP + _n_try * _LINE_H + max(0, _n_try - 1) * _ITEM_GAP
+    ) if _n_try else 0
     _try_col_h = (2 * _LIST_PAD + _list_content_h) if _n_try else 0
 
-    # Sam takes ~60% of the column; try list sits just above; top is naturally empty
     _sam_h = min(int(H * 0.60), H - _try_col_h - _LX * 2)
     _sam_h = max(_sam_h, 40)
 
@@ -623,20 +626,32 @@ def show_checkin(
         if _img:
             iv = NSImageView.alloc().initWithFrame_(NSMakeRect(_LX, _LX, X - _LX * 2, _sam_h))
             iv.setImage_(_img)
-            iv.setImageScaling_(3)   # NSImageScaleProportionallyUpOrDown
-            iv.setImageAlignment_(5)  # NSImageAlignBottom
+            iv.setImageScaling_(3)
+            iv.setImageAlignment_(5)
             cv.addSubview_(iv)
 
-    # Try bullet items anchored to Sam's top, stacked upward (i=0 → topmost)
     if active_tries:
         _sam_top = _LX + _sam_h
+        # Bullet items: i=0 topmost, i=N-1 closest to Sam
         for _ti, _try_text in enumerate(active_tries):
             _item_y = _sam_top + _LIST_PAD + (_n_try - 1 - _ti) * (_LINE_H + _ITEM_GAP)
             cv.addSubview_(_mlabel(
                 f"・{_try_text}",
                 NSMakeRect(_LX, _item_y, X - _LX * 2, _LINE_H),
                 NSFont.systemFontOfSize_(13),
+                color=NSColor.colorWithWhite_alpha_(0.55, 1.0),
             ))
+        # "Try" heading above the items
+        _heading_y = (
+            _sam_top + _LIST_PAD
+            + _n_try * _LINE_H + max(0, _n_try - 1) * _ITEM_GAP + _LABEL_GAP
+        )
+        cv.addSubview_(_label(
+            "Try",
+            NSMakeRect(_LX, _heading_y, X - _LX * 2, _LABEL_H),
+            NSFont.boldSystemFontOfSize_(11),
+            color=NSColor.colorWithWhite_alpha_(0.40, 1.0),
+        ))
 
     # ── 今日やりたいこと（ドラッグで並び替え可）──────────────────────────────
     cv.addSubview_(_label(
