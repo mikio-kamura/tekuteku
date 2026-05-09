@@ -2,6 +2,7 @@
 """てくてく — macOS menu bar productivity app with native AppKit dialogs."""
 import json
 import os
+import random
 from datetime import datetime, timedelta
 from typing import List, Optional
 
@@ -22,6 +23,7 @@ from AppKit import (
     NSMenuItem,
     NSEventModifierFlagCommand,
     NSPasteboardTypeString,
+    NSScreen,
     NSScrollView,
     NSStrikethroughStyleAttributeName,
     NSTableColumn,
@@ -195,6 +197,7 @@ class _TodayTaskTableModel(NSObject):
         if self is None:
             return None
         self.items = list(items or [])
+        self.show_numbers = False
         return self
 
     def numberOfRowsInTableView_(self, _table):
@@ -204,7 +207,10 @@ class _TodayTaskTableModel(NSObject):
         if 0 <= row < len(self.items):
             if column.identifier() == "done":
                 return 1 if self.items[row].get("done") else 0
-            return self.items[row]["text"]
+            text = self.items[row]["text"]
+            if self.show_numbers:
+                return f"{row + 1}. {text}"
+            return text
         return ""
 
     def tableView_setObjectValue_forTableColumn_row_(self, _table, value, column, row):
@@ -242,6 +248,15 @@ class _TodayTaskTableModel(NSObject):
 
 
 # ── Custom modal window ───────────────────────────────────────────────────────
+
+
+class _PinWindowDelegate(NSObject):
+    """Delegate for the floating pin window — notifies app when user closes it."""
+    app_ref = None
+
+    def windowWillClose_(self, _notif):
+        if self.app_ref is not None:
+            self.app_ref._on_pin_window_close()
 
 
 class _Handler(NSObject):
@@ -607,6 +622,7 @@ def show_checkin(
         color=NSColor.systemBlueColor(),
     ))
     today_model = _TodayTaskTableModel.alloc().initWithItems_(today_items)
+    today_model.show_numbers = True
     scroll_h = min(max(n, 1), MAX_VIS) * ITEM_H if n else 22
     scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(X + 24, items_bottom_y, W - X - 44, scroll_h))
     scroll.setHasVerticalScroller_(n > MAX_VIS)
@@ -717,7 +733,7 @@ def show_checkin(
     cv.addSubview_(field_next_next)
     cv.addSubview_(field_session)
 
-    cv.addSubview_(_label("サムからのメッセージ", NSMakeRect(X + 20, 90, W - X - 40, 16), NSFont.systemFontOfSize_(12)))
+    cv.addSubview_(_label("コメント（メニューバーに表示）", NSMakeRect(X + 20, 90, W - X - 40, 16), NSFont.systemFontOfSize_(12)))
     field_msg = _input_field(NSMakeRect(X + 20, 64, W - X - 40, 24), NSFont.systemFontOfSize_(14),
                              placeholder="例: 焦らず1行だけ進める", default=current_message)
     cv.addSubview_(field_msg)
@@ -856,10 +872,14 @@ class ProgressChecker(rumps.App):
         self.data = self._load()
         self._checkin_active = False
         self._break_mode = False
+        self._pin_win = None
+        self._pin_msg_label = None
+        self._pin_delegate = None
 
         self._task_item = rumps.MenuItem("📌 タスク未設定", callback=None)
         self._message_item = rumps.MenuItem("💬 コメント: 未設定", callback=None)
         self._next_item = rumps.MenuItem("⏭ 次: 未設定", callback=None)
+        self._pin_item = rumps.MenuItem("📌 サムをピン留め", callback=self._cmd_toggle_pin)
         self.menu = [
             self._task_item,
             self._message_item,
@@ -867,6 +887,8 @@ class ProgressChecker(rumps.App):
             None,
             rumps.MenuItem("🔄 今すぐチェックイン",    callback=self._cmd_checkin),
             rumps.MenuItem("⏱ セッション時間を変更",  callback=self._cmd_edit_interval),
+            self._pin_item,
+            rumps.MenuItem("✉️ サムのメッセージを編集", callback=self._cmd_edit_sam_messages),
             None,
             rumps.MenuItem("🌟 長期目標を変更",        callback=self._cmd_edit_long),
             rumps.MenuItem("📅 中期目標を変更",        callback=self._cmd_edit_mid),
@@ -907,6 +929,8 @@ class ProgressChecker(rumps.App):
                 data.setdefault("next_task", "")
                 data.setdefault("next_next_task", "")
                 data.setdefault("current_message", "")
+                data.setdefault("sam_messages", [])
+                data.setdefault("sam_message", "")
                 data.setdefault("today_date", datetime.now().strftime("%Y-%m-%d"))
                 data.setdefault("history", [])
                 return data
@@ -922,6 +946,8 @@ class ProgressChecker(rumps.App):
             "next_task": "",
             "next_next_task": "",
             "current_message": "",
+            "sam_messages": [],
+            "sam_message": "",
             "interval_minutes": DEFAULT_INTERVAL,
             "today_date": datetime.now().strftime("%Y-%m-%d"),
             "history": [],
@@ -941,6 +967,12 @@ class ProgressChecker(rumps.App):
         self._message_item.title = f"💬 コメント: {_truncate10(msg)}"
         self._next_item.title = f"⏭ 次: {_truncate10(next_task)}"
         self._update_countdown()
+        sam_msg = self.data.get("sam_message") or "—"
+        if self._pin_win is not None and self._pin_msg_label is not None:
+            try:
+                self._pin_msg_label.setStringValue_(sam_msg)
+            except Exception:
+                pass
 
     def _install_edit_shortcuts(self):
         try:
@@ -1256,6 +1288,9 @@ class ProgressChecker(rumps.App):
         self.data["next_task"] = queued_next_task or ""
         self.data["next_next_task"] = ""
         self.data["current_message"] = message or ""
+        sam_msgs = self.data.get("sam_messages", [])
+        if sam_msgs:
+            self.data["sam_message"] = random.choice(sam_msgs)
         if session_mins is not None:
             self.data["interval_minutes"] = session_mins
         self._save()
@@ -1266,6 +1301,97 @@ class ProgressChecker(rumps.App):
         subtitle = f"今やること: {new_task}"
         body = f"コメント: {self.data.get('current_message', '')}" if self.data.get("current_message") else ""
         notify("スタート！ 🚀", subtitle, body or f"{mins}分後にまたチェックインします")
+
+    # ── Pin window ────────────────────────────────────────────────────────
+
+    def _show_pin_window(self):
+        W, H = 200, 310
+        # Titled(1) | Closable(2) — no miniaturize/resize
+        win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(0, 0, W, H), 1 | 2, 2, False,
+        )
+        win.setTitle_("サム")
+        win.setOpaque_(False)
+        win.setBackgroundColor_(_BG)
+        win.setAppearance_(NSAppearance.appearanceNamed_("NSAppearanceNameAqua"))
+        win.setLevel_(3)  # NSFloatingWindowLevel
+        win.setHidesOnDeactivate_(False)
+        win.setCollectionBehavior_(_WC_MANAGED | _WC_CYCLE)
+
+        cv = win.contentView()
+
+        if os.path.exists(SAM_IMG):
+            _img = NSImage.alloc().initByReferencingFile_(SAM_IMG)
+            if _img:
+                iv = NSImageView.alloc().initWithFrame_(NSMakeRect(10, 62, W - 20, H - 72))
+                iv.setImage_(_img)
+                iv.setImageScaling_(3)
+                iv.setImageAlignment_(5)  # NSImageAlignBottom
+                cv.addSubview_(iv)
+
+        msg = self.data.get("sam_message") or "—"
+        self._pin_msg_label = _mlabel(
+            msg,
+            NSMakeRect(10, 8, W - 20, 58),
+            NSFont.systemFontOfSize_(14),
+            color=NSColor.colorWithWhite_alpha_(0.2, 1.0),
+        )
+        cv.addSubview_(self._pin_msg_label)
+
+        self._pin_delegate = _PinWindowDelegate.alloc().init()
+        self._pin_delegate.app_ref = self
+        win.setDelegate_(self._pin_delegate)
+
+        # Position top-right of visible screen area
+        try:
+            sr = NSScreen.mainScreen().visibleFrame()
+            win_x = sr.origin.x + sr.size.width - W - 20
+            win_y = sr.origin.y + sr.size.height - H - 10
+            win.setFrameOrigin_((win_x, win_y))
+        except Exception:
+            win.center()
+
+        self._pin_win = win
+        win.orderFront_(None)
+        self._pin_item.title = "📌 サムを隠す"
+
+    def _hide_pin_window(self):
+        if self._pin_win is not None:
+            self._pin_win.orderOut_(None)
+            self._pin_win = None
+            self._pin_msg_label = None
+        self._pin_item.title = "📌 サムをピン留め"
+
+    def _on_pin_window_close(self):
+        self._pin_win = None
+        self._pin_msg_label = None
+        self._pin_item.title = "📌 サムをピン留め"
+
+    def _cmd_toggle_pin(self, _):
+        if self._pin_win is not None:
+            self._hide_pin_window()
+        else:
+            self._show_pin_window()
+
+    def _cmd_edit_sam_messages(self, _):
+        if self._checkin_active:
+            return
+        self._checkin_active = True
+        try:
+            current = self.data.get("sam_messages", [])
+            val = show_list_input(
+                "サムのメッセージ一覧",
+                "チェックインごとにランダム表示するメッセージ（1行に1つ）",
+                current,
+            )
+            if val is not None:
+                self.data["sam_messages"] = val
+                if val:
+                    self.data["sam_message"] = random.choice(val)
+                    self._refresh_ui()
+                self._save()
+        finally:
+            self._checkin_active = False
 
     # ── Menu callbacks ────────────────────────────────────────────────────
 
