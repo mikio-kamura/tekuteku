@@ -1053,6 +1053,164 @@ def show_kpt_history(kpt_history: list) -> None:
         _hide()
 
 
+def show_weekly_review(
+    week_start_str: str,
+    daily_summaries: list,
+    prev_keep: list,
+    prev_problem: list,
+    prev_try: list,
+) -> Optional[dict]:
+    """Weekly retrospective: shows last week's tasks + KPT + summary comment.
+    Returns {"keep": [...], "problem": [...], "try": [...], "summary": str} or None (skipped)."""
+    W, H = 600, 680
+    win = _make_win("先週の振り返り", W, H)
+    cv = win.contentView()
+
+    try:
+        mon_dt = datetime.strptime(week_start_str, "%Y-%m-%d")
+        sun_dt = mon_dt + timedelta(days=6)
+        title_text = (
+            f"先週の振り返り — {mon_dt.month}/{mon_dt.day}（月）〜"
+            f"{sun_dt.month}/{sun_dt.day}（日）"
+        )
+    except (ValueError, TypeError):
+        title_text = "先週の振り返り"
+
+    cv.addSubview_(_label(title_text, NSMakeRect(20, 642, W-40, 22), NSFont.boldSystemFontOfSize_(13)))
+
+    # Task summary
+    cv.addSubview_(_label("先週のタスク", NSMakeRect(20, 618, 100, 16), NSFont.boldSystemFontOfSize_(12)))
+    lines: list[str] = []
+    if daily_summaries:
+        for entry in daily_summaries:
+            date = entry.get("date", "")
+            tasks = entry.get("tasks", [])
+            done_count = sum(1 for t in tasks if t.get("done"))
+            try:
+                d = datetime.strptime(date, "%Y-%m-%d")
+                date_label = f"─── {d.month}/{d.day}（{WEEKDAY_JP[d.weekday()]}）  {done_count}/{len(tasks)} 完了"
+            except (ValueError, TypeError):
+                date_label = f"─── {date}  {done_count}/{len(tasks)} 完了"
+            lines.append(date_label)
+            for task in tasks:
+                mark = "✅" if task.get("done") else "☐"
+                lines.append(f"  {mark}  {task.get('text', '')}")
+            lines.append("")
+    else:
+        lines = ["先週の記録はありません。"]
+    scroll, tv = _text_view(lines, NSMakeRect(20, 420, W-40, 196))
+    tv.setEditable_(False)
+    tv.setFont_(NSFont.systemFontOfSize_(12))
+    cv.addSubview_(scroll)
+
+    cv.addSubview_(_sep(NSMakeRect(20, 410, W-40, 1)))
+
+    # KPT section
+    cv.addSubview_(_label("KPT振り返り", NSMakeRect(20, 390, 100, 16), NSFont.boldSystemFontOfSize_(12)))
+    cv.addSubview_(_label(
+        "1行に1つ入力してください",
+        NSMakeRect(20, 372, W-40, 14),
+        NSFont.systemFontOfSize_(11), color=NSColor.colorWithWhite_alpha_(0.5, 1.0),
+    ))
+
+    col_w = (W - 60) // 3  # 180
+    headers = [
+        ("✅ Keep", "うまくいったこと", prev_keep),
+        ("⚠️ Problem", "改善できること", prev_problem),
+        ("🚀 Try", "次に試すこと", prev_try),
+    ]
+    text_views = []
+    for idx, (h_title, h_sub, items) in enumerate(headers):
+        x = 20 + idx * (col_w + 10)
+        cv.addSubview_(_label(h_title, NSMakeRect(x, 348, col_w, 18), NSFont.boldSystemFontOfSize_(12)))
+        cv.addSubview_(_label(
+            h_sub, NSMakeRect(x, 328, col_w, 14),
+            NSFont.systemFontOfSize_(11), color=NSColor.colorWithWhite_alpha_(0.5, 1.0),
+        ))
+        scroll2, tv2 = _text_view(items, NSMakeRect(x, 98, col_w, 226))
+        tv2.setFont_(NSFont.systemFontOfSize_(13))
+        cv.addSubview_(scroll2)
+        text_views.append(tv2)
+
+    # Summary comment
+    cv.addSubview_(_label(
+        "今週を一言でまとめると",
+        NSMakeRect(20, 78, W-40, 16),
+        NSFont.boldSystemFontOfSize_(12),
+    ))
+    summary_field = _input_field(NSMakeRect(20, 50, W-40, 24), NSFont.systemFontOfSize_(13),
+                                 placeholder="例: 集中できた週だった、疲れ気味だったが粘れた…")
+    cv.addSubview_(summary_field)
+
+    _btn(cv, "スキップ", _BTN2, NSMakeRect(W-264, 12, 116, 32))
+    _btn(cv, "決定", _BTN1, NSMakeRect(W-136, 12, 116, 32), primary=True)
+    win.makeFirstResponder_(text_views[0])
+    _show(win)
+    try:
+        resp = NSApp.runModalForWindow_(win)
+        if resp in (_CANCEL, _BTN2):
+            return None
+        def _parse_tv(t):
+            return [l.strip() for l in str(t.string()).split("\n") if l.strip()]
+        return {
+            "keep": _parse_tv(text_views[0]),
+            "problem": _parse_tv(text_views[1]),
+            "try": _parse_tv(text_views[2]),
+            "summary": summary_field.stringValue().strip(),
+        }
+    finally:
+        win.orderOut_(None)
+        _hide()
+
+
+def show_weekly_review_history(weekly_reviews: list) -> None:
+    """Read-only viewer for past weekly retrospective records."""
+    W, H = 520, 560
+    win = _make_win("週次振り返りの記録", W, H)
+    cv = win.contentView()
+    cv.addSubview_(_label(
+        "週次振り返りの記録",
+        NSMakeRect(20, H-40, W-40, 24),
+        NSFont.boldSystemFontOfSize_(15),
+        color=NSColor.colorWithWhite_alpha_(0.15, 1.0),
+    ))
+    lines: list[str] = []
+    for entry in reversed(weekly_reviews):
+        ws = entry.get("week_start", "")
+        we = entry.get("week_end", "")
+        try:
+            mon_dt = datetime.strptime(ws, "%Y-%m-%d")
+            sun_dt = datetime.strptime(we, "%Y-%m-%d")
+            week_label = f"─── {mon_dt.month}/{mon_dt.day}（月）〜{sun_dt.month}/{sun_dt.day}（日）"
+        except (ValueError, TypeError):
+            week_label = f"─── {ws} 〜 {we}"
+        lines.append(week_label)
+        kpt = entry.get("kpt", {})
+        summary = kpt.get("summary", "")
+        if summary:
+            lines.append(f"  💬 {summary}")
+        for section, label in (("keep", "✅ Keep"), ("problem", "⚠️ Problem"), ("try", "🚀 Try")):
+            lines.append(f"  {label}")
+            items = kpt.get(section, [])
+            for item in items:
+                lines.append(f"    • {item}")
+            if not items:
+                lines.append("    （なし）")
+        lines.append("")
+    if not lines:
+        lines = ["まだ週次振り返りの記録がありません。"]
+    scroll, tv = _text_view(lines, NSMakeRect(20, 52, W-40, H-108))
+    tv.setEditable_(False)
+    cv.addSubview_(scroll)
+    _btn(cv, "閉じる", _BTN1, NSMakeRect(W-136, 12, 116, 32), primary=True)
+    _show(win)
+    try:
+        NSApp.runModalForWindow_(win)
+    finally:
+        win.orderOut_(None)
+        _hide()
+
+
 def notify(title: str, subtitle: str, body: str = ""):
     try:
         rumps.notification(title, subtitle, body)
@@ -1098,6 +1256,7 @@ class ProgressChecker(rumps.App):
             None,
             rumps.MenuItem("📝 今日の振り返り（KPT）",    callback=self._cmd_do_retrospective),
             rumps.MenuItem("📊 過去の振り返りを見る",      callback=self._cmd_show_kpt_history),
+            rumps.MenuItem("📆 週次振り返りを見る",        callback=self._cmd_show_weekly_review_history),
             None,
             rumps.MenuItem("❌ 終了", callback=rumps.quit_application),
         ]
@@ -1134,6 +1293,7 @@ class ProgressChecker(rumps.App):
                 data.setdefault("sam_message", "")
                 data.setdefault("kpt", {"date": "", "keep": [], "problem": [], "try": []})
                 data.setdefault("kpt_history", [])
+                data.setdefault("weekly_review_history", [])
                 data.setdefault("active_tries", [])
                 data.setdefault("today_date", datetime.now().strftime("%Y-%m-%d"))
                 data.setdefault("history", [])
@@ -1338,8 +1498,52 @@ class ProgressChecker(rumps.App):
         timer.stop()
         if self._checkin_active:
             return
-        notify("📅 新しい週が始まりました！", "今週の計画を立てましょう")
+
+        # Step 1: weekly retrospective of last week
+        self._checkin_active = True
+        try:
+            today_str = self.data.get("today_date", datetime.now().strftime("%Y-%m-%d"))
+            try:
+                today_dt = datetime.strptime(today_str, "%Y-%m-%d")
+            except ValueError:
+                today_dt = datetime.now()
+            this_monday = _monday_of(today_dt)
+            last_monday = this_monday - timedelta(days=7)
+            last_week_start = last_monday.strftime("%Y-%m-%d")
+            last_week_end = (last_monday + timedelta(days=6)).strftime("%Y-%m-%d")
+
+            history = self.data.get("history", [])
+            last_week_entries = sorted(
+                [e for e in history if last_week_start <= e.get("date", "") <= last_week_end],
+                key=lambda e: e.get("date", ""),
+            )
+
+            notify("📅 新しい週が始まりました！", "まず先週を振り返りましょう")
+            result = show_weekly_review(last_week_start, last_week_entries, [], [], [])
+            if result is not None:
+                review_entry = {
+                    "week_start": last_week_start,
+                    "week_end": last_week_end,
+                    "kpt": result,
+                }
+                weekly_reviews = self.data.setdefault("weekly_review_history", [])
+                for i, entry in enumerate(weekly_reviews):
+                    if entry.get("week_start") == last_week_start:
+                        weekly_reviews[i] = review_entry
+                        break
+                else:
+                    weekly_reviews.append(review_entry)
+                self._save()
+                selected = show_try_selector(result.get("try", []))
+                self.data["active_tries"] = selected
+                self._save()
+        finally:
+            self._checkin_active = False
+
+        # Step 2: set this week's plan
+        notify("📋 今週の計画を立てましょう！", "")
         self._edit_weekly()
+
         # After setting weekly plan, reload today's tasks
         today_str = self.data.get("today_date", datetime.now().strftime("%Y-%m-%d"))
         try:
@@ -1691,6 +1895,15 @@ class ProgressChecker(rumps.App):
         self._checkin_active = True
         try:
             show_kpt_history(self.data.get("kpt_history", []))
+        finally:
+            self._checkin_active = False
+
+    def _cmd_show_weekly_review_history(self, _):
+        if self._checkin_active:
+            return
+        self._checkin_active = True
+        try:
+            show_weekly_review_history(self.data.get("weekly_review_history", []))
         finally:
             self._checkin_active = False
 
