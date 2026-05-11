@@ -2,6 +2,7 @@
 """てくてく — macOS menu bar productivity app with native AppKit dialogs."""
 import json
 import os
+os.environ.setdefault('OS_ACTIVITY_MODE', 'disable')  # suppress macOS framework log noise
 import random
 from datetime import datetime, timedelta
 from typing import List, Optional
@@ -31,6 +32,7 @@ from AppKit import (
     NSButtonCell,
     NSImageView,
     NSTextField,
+    NSTextFieldCell,
     NSTextView,
     NSView,
     NSWindow,
@@ -277,11 +279,36 @@ class _Handler(NSObject):
             win.orderFrontRegardless()
 
 
+class _VCenteredCell(NSTextFieldCell):
+    """NSTextFieldCell that draws text vertically centered in its bounds."""
+    def drawingRectForBounds_(self, rect):
+        nr = objc.super(_VCenteredCell, self).drawingRectForBounds_(rect)
+        text_size = self.cellSizeForBounds_(rect)
+        delta = nr.size.height - text_size.height
+        if delta > 0:
+            return NSMakeRect(nr.origin.x, nr.origin.y + delta / 2.0,
+                              nr.size.width, nr.size.height - delta)
+        return nr
+
+
+class _KeyWindow(NSWindow):
+    """NSWindow subclass that handles edit key equivalents directly.
+    Necessary for LSUIElement apps where the main menu bar is inactive."""
+    def performKeyEquivalent_(self, event):
+        if event.modifierFlags() & NSEventModifierFlagCommand:
+            sel = {"c": "copy:", "v": "paste:", "x": "cut:",
+                   "a": "selectAll:", "z": "undo:"}.get(
+                       event.charactersIgnoringModifiers())
+            if sel and NSApp.sendAction_to_from_(sel, None, None):
+                return True
+        return objc.super(_KeyWindow, self).performKeyEquivalent_(event)
+
+
 _H = _Handler.alloc().init()
 
 
 def _make_win(title: str, w: int, h: int) -> NSWindow:
-    win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+    win = _KeyWindow.alloc().initWithContentRect_styleMask_backing_defer_(
         NSMakeRect(0, 0, w, h), _STYLE, 2, False,
     )
     win.setTitle_(title)
@@ -1743,25 +1770,35 @@ class ProgressChecker(rumps.App):
 
         cv = win.contentView()
 
-        _TEXT_H = 72  # total height of text block
-        _PAD = 8      # top/bottom padding within text block
+        _TEXT_H = 72   # height of text block above image
+        _IMG_PAD = 15  # padding below image
+        _PAD_H = 11    # horizontal padding for text label
 
         if os.path.exists(SAM_IMG):
             _img = NSImage.alloc().initByReferencingFile_(SAM_IMG)
             if _img:
-                iv = NSImageView.alloc().initWithFrame_(NSMakeRect(10, 0, W - 20, H - _TEXT_H))
+                iv = NSImageView.alloc().initWithFrame_(
+                    NSMakeRect(10, _IMG_PAD, W - 20, H - _TEXT_H - _IMG_PAD)
+                )
                 iv.setImage_(_img)
                 iv.setImageScaling_(3)
                 iv.setImageAlignment_(5)  # NSImageAlignBottom
                 cv.addSubview_(iv)
 
         msg = self.data.get("sam_message") or "—"
-        self._pin_msg_label = _mlabel(
-            msg,
-            NSMakeRect(_PAD, H - _TEXT_H + _PAD, W - 2 * _PAD, _TEXT_H - 2 * _PAD),
-            NSFont.systemFontOfSize_(14),
-            color=NSColor.colorWithWhite_alpha_(0.2, 1.0),
+        _cell = _VCenteredCell.alloc().initTextCell_(msg)
+        _cell.setFont_(NSFont.systemFontOfSize_(14))
+        _cell.setWraps_(True)
+        _cell.setScrollable_(False)
+        _cell.setTextColor_(NSColor.colorWithWhite_alpha_(0.2, 1.0))
+        self._pin_msg_label = NSTextField.alloc().initWithFrame_(
+            NSMakeRect(_PAD_H, H - _TEXT_H, W - 2 * _PAD_H, _TEXT_H)
         )
+        self._pin_msg_label.setCell_(_cell)
+        self._pin_msg_label.setBezeled_(False)
+        self._pin_msg_label.setDrawsBackground_(False)
+        self._pin_msg_label.setEditable_(False)
+        self._pin_msg_label.setSelectable_(False)
         cv.addSubview_(self._pin_msg_label)
 
         self._pin_delegate = _PinWindowDelegate.alloc().init()
