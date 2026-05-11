@@ -1303,6 +1303,8 @@ class ProgressChecker(rumps.App):
 
         if not self.data["goals"].get("short"):
             rumps.Timer(self._first_run, 1).start()
+        else:
+            rumps.Timer(self._autoshow_pin, 0.5).start()
 
     # ── Persistence ───────────────────────────────────────────────────────
 
@@ -1606,9 +1608,14 @@ class ProgressChecker(rumps.App):
 
     # ── Core flows ────────────────────────────────────────────────────────
 
+    def _autoshow_pin(self, timer: rumps.Timer):
+        timer.stop()
+        self._show_pin_window()
+
     def _first_run(self, timer: rumps.Timer):
         timer.stop()
         self._setup_all_goals()
+        self._show_pin_window()
 
     def _setup_all_goals(self):
         self._checkin_active = True
