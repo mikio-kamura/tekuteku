@@ -271,6 +271,11 @@ class _Handler(NSObject):
         NSApp.stopModalWithCode_(_CANCEL)
         return False
 
+    def windowDidBecomeKey_(self, notif):
+        win = notif.object()
+        if win is not None:
+            win.orderFrontRegardless()
+
 
 _H = _Handler.alloc().init()
 
@@ -1348,6 +1353,12 @@ class ProgressChecker(rumps.App):
                 main = NSMenu.alloc().initWithTitle_("")
                 NSApp.setMainMenu_(main)
 
+            # macOS requires an application menu at index 0 to process key equivalents
+            if main.numberOfItems() == 0 or main.itemAtIndex_(0).title() != "":
+                app_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("", None, "")
+                app_item.setSubmenu_(NSMenu.alloc().initWithTitle_(""))
+                main.insertItem_atIndex_(app_item, 0)
+
             edit_root = None
             for i in range(main.numberOfItems()):
                 item = main.itemAtIndex_(i)
@@ -1732,10 +1743,13 @@ class ProgressChecker(rumps.App):
 
         cv = win.contentView()
 
+        _TEXT_H = 72  # total height of text block
+        _PAD = 8      # top/bottom padding within text block
+
         if os.path.exists(SAM_IMG):
             _img = NSImage.alloc().initByReferencingFile_(SAM_IMG)
             if _img:
-                iv = NSImageView.alloc().initWithFrame_(NSMakeRect(10, 62, W - 20, H - 72))
+                iv = NSImageView.alloc().initWithFrame_(NSMakeRect(10, 0, W - 20, H - _TEXT_H))
                 iv.setImage_(_img)
                 iv.setImageScaling_(3)
                 iv.setImageAlignment_(5)  # NSImageAlignBottom
@@ -1744,7 +1758,7 @@ class ProgressChecker(rumps.App):
         msg = self.data.get("sam_message") or "—"
         self._pin_msg_label = _mlabel(
             msg,
-            NSMakeRect(10, 8, W - 20, 58),
+            NSMakeRect(_PAD, H - _TEXT_H + _PAD, W - 2 * _PAD, _TEXT_H - 2 * _PAD),
             NSFont.systemFontOfSize_(14),
             color=NSColor.colorWithWhite_alpha_(0.2, 1.0),
         )
