@@ -1611,6 +1611,7 @@ class ProgressChecker(rumps.App):
     def _autoshow_pin(self, timer: rumps.Timer):
         timer.stop()
         self._show_pin_window()
+        self._do_checkin()
 
     def _first_run(self, timer: rumps.Timer):
         timer.stop()
