@@ -1805,11 +1805,11 @@ class ProgressChecker(rumps.App):
         self._pin_delegate.app_ref = self
         win.setDelegate_(self._pin_delegate)
 
-        # Position top-right of visible screen area
+        # Position bottom-left of visible screen area
         try:
             sr = NSScreen.mainScreen().visibleFrame()
-            win_x = sr.origin.x + sr.size.width - W - 20
-            win_y = sr.origin.y + sr.size.height - H - 10
+            win_x = sr.origin.x + 20
+            win_y = sr.origin.y + 10
             win.setFrameOrigin_((win_x, win_y))
         except Exception:
             win.center()
