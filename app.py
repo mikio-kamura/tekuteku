@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """てくてく — macOS menu bar productivity app with native AppKit dialogs."""
+import ctypes
 import json
 import os
 os.environ.setdefault('OS_ACTIVITY_MODE', 'disable')  # suppress macOS framework log noise
@@ -7,15 +8,24 @@ import random
 from datetime import datetime, timedelta
 from typing import List, Optional
 
+# Set process name before AppKit loads so window switcher shows "てくてく" not "Python"
+try:
+    ctypes.CDLL(None).setprogname(b"\xe3\x81\xa6\xe3\x81\x8f\xe3\x81\xa6\xe3\x81\x8f")
+except Exception:
+    pass
+
 import objc
 import rumps
-from Foundation import NSObject
+from Foundation import NSObject, NSRunLoop, NSTimer, NSRunLoopCommonModes
 from AppKit import (
     NSApp,
     NSAppearance,
     NSAttributedString,
     NSButton,
     NSColor,
+    NSCompositingOperationSourceOver,
+    NSEvent,
+    NSEventMaskKeyDown,
     NSFont,
     NSForegroundColorAttributeName,
     NSImage,
@@ -36,6 +46,7 @@ from AppKit import (
     NSTextView,
     NSView,
     NSWindow,
+    NSZeroRect,
 )
 
 DATA_FILE = os.path.expanduser("~/.tekuteku.json")
@@ -59,10 +70,80 @@ _CANCEL = -1
 
 _BG = NSColor.colorWithRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.93)
 ICON_CANDIDATES = [
-    os.path.join(os.path.dirname(__file__), "white-star.png"),
-    os.path.join(os.path.dirname(__file__), "assets", "white-star-d57dad08-3034-48d0-9de0-eb6324c055c3.png"),
-    "/Users/mikio_kamura/.cursor/projects/Volumes-ssd-pyoi-00-dev-0-personal-diy-qol-tools-progress-checker/assets/white-star-d57dad08-3034-48d0-9de0-eb6324c055c3.png",
+    os.path.join(os.path.dirname(__file__), "sam.png"),
 ]
+
+
+def _pad_icon_to_square(img):
+    """Return a new NSImage with the source centered in a square canvas (transparent padding)."""
+    orig_w = img.size().width
+    orig_h = img.size().height
+    size = max(orig_w, orig_h)
+    scale = min(size / orig_w, size / orig_h)
+    draw_w = orig_w * scale
+    draw_h = orig_h * scale
+    x = (size - draw_w) / 2
+    y = (size - draw_h) / 2
+    square = NSImage.alloc().initWithSize_((size, size))
+    square.lockFocus()
+    img.drawInRect_fromRect_operation_fraction_(
+        NSMakeRect(x, y, draw_w, draw_h), NSZeroRect, NSCompositingOperationSourceOver, 1.0)
+    square.unlockFocus()
+    return square
+
+
+def _apply_icon():
+    for icon_path in ICON_CANDIDATES:
+        if not os.path.exists(icon_path):
+            continue
+        try:
+            img = NSImage.alloc().initWithContentsOfFile_(icon_path)
+            if img is not None:
+                NSApp.setApplicationIconImage_(_pad_icon_to_square(img))
+                return
+        except Exception:
+            continue
+
+
+class _IconApplier(NSObject):
+    def apply_(self, timer):
+        _apply_icon()
+
+
+_icon_applier = _IconApplier.alloc().init()
+
+
+def _schedule_icon():
+    """Schedule icon re-application in NSRunLoopCommonModes so it fires even inside modal loops."""
+    t = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
+        0.0, _icon_applier, "apply:", None, False)
+    NSRunLoop.mainRunLoop().addTimer_forMode_(t, NSRunLoopCommonModes)
+
+
+def _setup_app_menu():
+    """Ensure the application menu shows 'てくてく' and Cmd+Q quits. Called each time the app activates."""
+    try:
+        main = NSApp.mainMenu()
+        if main is None:
+            main = NSMenu.alloc().initWithTitle_("")
+            NSApp.setMainMenu_(main)
+        if main.numberOfItems() == 0 or main.itemAtIndex_(0).title() != "てくてく":
+            app_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("てくてく", None, "")
+            app_submenu = NSMenu.alloc().initWithTitle_("てくてく")
+            quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "てくてくを終了", "terminate:", "q")
+            quit_item.setKeyEquivalentModifierMask_(NSEventModifierFlagCommand)
+            quit_item.setTarget_(NSApp)
+            app_submenu.addItem_(quit_item)
+            app_item.setSubmenu_(app_submenu)
+            if main.numberOfItems() == 0:
+                main.insertItem_atIndex_(app_item, 0)
+            else:
+                main.removeItemAtIndex_(0)
+                main.insertItem_atIndex_(app_item, 0)
+    except Exception:
+        pass
+
 
 # ── Shared UI helpers ─────────────────────────────────────────────────────────
 
@@ -340,6 +421,9 @@ def _btn(cv, title: str, code: int, rect, primary: bool = False) -> NSButton:
 
 def _show(win: NSWindow) -> None:
     NSApp.setActivationPolicy_(0)
+    _setup_app_menu()
+    _apply_icon()
+    _schedule_icon()  # re-apply on first modal run loop tick (NSRunLoopCommonModes)
     NSApp.activateIgnoringOtherApps_(True)
     win.makeKeyAndOrderFront_(None)
     win.orderFrontRegardless()
@@ -1377,17 +1461,9 @@ class ProgressChecker(rumps.App):
 
     def _install_edit_shortcuts(self):
         try:
+            _setup_app_menu()
+
             main = NSApp.mainMenu()
-            if main is None:
-                main = NSMenu.alloc().initWithTitle_("")
-                NSApp.setMainMenu_(main)
-
-            # macOS requires an application menu at index 0 to process key equivalents
-            if main.numberOfItems() == 0 or main.itemAtIndex_(0).title() != "":
-                app_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("", None, "")
-                app_item.setSubmenu_(NSMenu.alloc().initWithTitle_(""))
-                main.insertItem_atIndex_(app_item, 0)
-
             edit_root = None
             for i in range(main.numberOfItems()):
                 item = main.itemAtIndex_(i)
@@ -1417,6 +1493,20 @@ class ProgressChecker(rumps.App):
         except Exception:
             pass
 
+        # Fallback: local key monitor catches Cmd+Q even if menu dispatch fails
+        try:
+            NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
+                NSEventMaskKeyDown,
+                lambda event: (
+                    rumps.quit_application() or None
+                    if (event.modifierFlags() & NSEventModifierFlagCommand
+                        and event.charactersIgnoringModifiers() == "q")
+                    else event
+                ),
+            )
+        except Exception:
+            pass
+
     def _apply_app_icon(self):
         for icon_path in ICON_CANDIDATES:
             if not os.path.exists(icon_path):
@@ -1424,7 +1514,7 @@ class ProgressChecker(rumps.App):
             try:
                 img = NSImage.alloc().initByReferencingFile_(icon_path)
                 if img is not None:
-                    NSApp.setApplicationIconImage_(img)
+                    NSApp.setApplicationIconImage_(_pad_icon_to_square(img))
                     return
             except Exception:
                 continue

@@ -14,11 +14,48 @@ echo "==> Building $APP"
 echo "  icon..."
 rm -rf "$ICONSET"
 mkdir "$ICONSET"
-SRC="$PROJECT/white-star.png"
-for size in 16 32 64 128 256 512; do
-  sips -z $size $size "$SRC" --out "$ICONSET/icon_${size}x${size}.png"        > /dev/null
-  sips -z $((size*2)) $((size*2)) "$SRC" --out "$ICONSET/icon_${size}x${size}@2x.png" > /dev/null
-done
+SRC="$PROJECT/sam.png"
+# Resize proportionally and pad to square with transparency (no stretching)
+"$PROJECT/.venv/bin/python" - "$SRC" "$ICONSET" <<'PYEOF'
+import sys
+from AppKit import NSImage, NSBitmapImageRep, NSGraphicsContext, NSZeroRect, NSMakeRect, NSCompositingOperationSourceOver
+
+src_path, iconset = sys.argv[1], sys.argv[2]
+src = NSImage.alloc().initWithContentsOfFile_(src_path)
+orig_w, orig_h = src.size().width, src.size().height
+
+entries = [
+    (16,   "icon_16x16.png"),
+    (32,   "icon_32x32.png"),
+    (64,   "icon_64x64.png"),
+    (128,  "icon_128x128.png"),
+    (256,  "icon_256x256.png"),
+    (512,  "icon_512x512.png"),
+    (32,   "icon_16x16@2x.png"),
+    (64,   "icon_32x32@2x.png"),
+    (128,  "icon_64x64@2x.png"),
+    (256,  "icon_128x128@2x.png"),
+    (512,  "icon_256x256@2x.png"),
+    (1024, "icon_512x512@2x.png"),
+]
+
+for size, name in entries:
+    scale = min(size / orig_w, size / orig_h)
+    draw_w = orig_w * scale
+    draw_h = orig_h * scale
+    x = (size - draw_w) / 2
+    y = (size - draw_h) / 2
+
+    rep = NSBitmapImageRep.alloc().initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel_(
+        None, size, size, 8, 4, True, False, "NSCalibratedRGBColorSpace", 0, 0)
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.setCurrentContext_(NSGraphicsContext.graphicsContextWithBitmapImageRep_(rep))
+    src.drawInRect_fromRect_operation_fraction_(NSMakeRect(x, y, draw_w, draw_h), NSZeroRect, NSCompositingOperationSourceOver, 1.0)
+    NSGraphicsContext.restoreGraphicsState()
+
+    png = rep.representationUsingType_properties_(4, None)  # NSBitmapImageFileTypePNG
+    png.writeToFile_atomically_(f"{iconset}/{name}", True)
+PYEOF
 iconutil -c icns "$ICONSET" -o /tmp/tekuteku.icns
 
 # --- Bundle skeleton ---
