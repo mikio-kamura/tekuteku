@@ -16,7 +16,7 @@ except Exception:
 
 import objc
 import rumps
-from Foundation import NSObject, NSRunLoop, NSTimer, NSRunLoopCommonModes, NSIndexSet
+from Foundation import NSObject, NSRunLoop, NSTimer, NSRunLoopCommonModes, NSModalPanelRunLoopMode, NSIndexSet
 from AppKit import (
     NSApp,
     NSAppearance,
@@ -128,7 +128,14 @@ _ui_ticker = _UiTicker.alloc().init()
 class _CheckinNudger(NSObject):
     """Fires a reminder notification every 5 minutes while the check-in dialog is open."""
     def nudge_(self, timer):
-        notify("⏰ まだチェックインしてないのか？", "タスク決めようぜ。")
+        try:
+            import subprocess
+            subprocess.Popen([
+                "osascript", "-e",
+                'display notification "タスク決めようぜ。" with title "⏰ まだチェックインしてないのか？"',
+            ])
+        except Exception:
+            pass
 
 
 _checkin_nudger = _CheckinNudger.alloc().init()
@@ -1827,6 +1834,7 @@ class ProgressChecker(rumps.App):
         nudge_timer = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
             CHECKIN_NUDGE_INTERVAL, _checkin_nudger, "nudge:", None, True)
         NSRunLoop.mainRunLoop().addTimer_forMode_(nudge_timer, NSRunLoopCommonModes)
+        NSRunLoop.mainRunLoop().addTimer_forMode_(nudge_timer, NSModalPanelRunLoopMode)
         try:
             while True:
                 action, new_task, queued_next_task, message, session_mins, updated_today = show_checkin(
