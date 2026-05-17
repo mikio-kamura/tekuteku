@@ -16,7 +16,7 @@ except Exception:
 
 import objc
 import rumps
-from Foundation import NSObject, NSRunLoop, NSTimer, NSRunLoopCommonModes, NSModalPanelRunLoopMode, NSIndexSet
+from Foundation import NSObject, NSRunLoop, NSTimer, NSRunLoopCommonModes, NSIndexSet
 from AppKit import (
     NSApp,
     NSAppearance,
@@ -1834,7 +1834,7 @@ class ProgressChecker(rumps.App):
         nudge_timer = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
             CHECKIN_NUDGE_INTERVAL, _checkin_nudger, "nudge:", None, True)
         NSRunLoop.mainRunLoop().addTimer_forMode_(nudge_timer, NSRunLoopCommonModes)
-        NSRunLoop.mainRunLoop().addTimer_forMode_(nudge_timer, NSModalPanelRunLoopMode)
+        NSRunLoop.mainRunLoop().addTimer_forMode_(nudge_timer, "NSModalPanelRunLoopMode")
         try:
             while True:
                 action, new_task, queued_next_task, message, session_mins, updated_today = show_checkin(
