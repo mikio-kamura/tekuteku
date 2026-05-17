@@ -16,7 +16,7 @@ except Exception:
 
 import objc
 import rumps
-from Foundation import NSObject, NSRunLoop, NSTimer, NSRunLoopCommonModes
+from Foundation import NSObject, NSRunLoop, NSTimer, NSRunLoopCommonModes, NSIndexSet
 from AppKit import (
     NSApp,
     NSAppearance,
@@ -111,6 +111,28 @@ class _IconApplier(NSObject):
 
 
 _icon_applier = _IconApplier.alloc().init()
+
+
+class _UiTicker(NSObject):
+    """Calls app._update_countdown() on each tick, even inside modal run loops."""
+    app_ref = None
+
+    def tick_(self, timer):
+        if self.app_ref is not None:
+            self.app_ref._update_countdown()
+
+
+_ui_ticker = _UiTicker.alloc().init()
+
+
+class _CheckinNudger(NSObject):
+    """Fires a reminder notification every 5 minutes while the check-in dialog is open."""
+    def nudge_(self, timer):
+        notify("⏰ まだチェックインしてないのか？", "タスク決めようぜ。")
+
+
+_checkin_nudger = _CheckinNudger.alloc().init()
+CHECKIN_NUDGE_INTERVAL = 5 * 60  # seconds
 
 
 def _schedule_icon():
@@ -660,9 +682,13 @@ def show_today_task_editor(title: str, items: list[dict]) -> Optional[list]:
                 if not text:
                     err.setStringValue_("追加するタスクを入力してください")
                     continue
-                model.items.append({"text": text, "done": False})
+                sel = table.selectedRow()
+                insert_at = (sel + 1) if sel >= 0 else len(model.items)
+                model.items.insert(insert_at, {"text": text, "done": False})
                 input_field.setStringValue_("")
                 table.reloadData()
+                table.selectRowIndexes_byExtendingSelection_(
+                    NSIndexSet.indexSetWithIndex_(insert_at), False)
                 continue
             if resp == _BTN2:
                 row = table.selectedRow()
@@ -1555,12 +1581,11 @@ class ProgressChecker(rumps.App):
         self._watchdog.start()
 
     def _start_ui_timer(self):
-        self._ui_timer = rumps.Timer(self._on_ui_tick, 1)
-        self._ui_timer.start()
-
-    def _on_ui_tick(self, _):
-        if not self._checkin_active:
-            self._update_countdown()
+        _ui_ticker.app_ref = self
+        t = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
+            1.0, _ui_ticker, "tick:", None, True)
+        NSRunLoop.mainRunLoop().addTimer_forMode_(t, NSRunLoopCommonModes)
+        self._ui_timer = t
 
     def _on_watchdog(self, _):
         if datetime.now() >= self._next_checkin_at:
@@ -1799,30 +1824,36 @@ class ProgressChecker(rumps.App):
             elif result == "replan":
                 notify("🔄 賢い判断！", "難しすぎたのかも", "もっと小さなタスクに分けてみよう 💡")
 
-        while True:
-            action, new_task, queued_next_task, message, session_mins, updated_today = show_checkin(
-                self.data["goals"],
-                today_date=self.data.get("today_date", ""),
-                current_task=self.data.get("current_task", ""),
-                queued_task=self.data.get("next_task", ""),
-                queued_next_task=self.data.get("next_next_task", ""),
-                current_message=self.data.get("current_message", ""),
-                current_interval=self.data.get("interval_minutes", DEFAULT_INTERVAL),
-                active_tries=self.data.get("active_tries", []),
-            )
+        nudge_timer = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
+            CHECKIN_NUDGE_INTERVAL, _checkin_nudger, "nudge:", None, True)
+        NSRunLoop.mainRunLoop().addTimer_forMode_(nudge_timer, NSRunLoopCommonModes)
+        try:
+            while True:
+                action, new_task, queued_next_task, message, session_mins, updated_today = show_checkin(
+                    self.data["goals"],
+                    today_date=self.data.get("today_date", ""),
+                    current_task=self.data.get("current_task", ""),
+                    queued_task=self.data.get("next_task", ""),
+                    queued_next_task=self.data.get("next_next_task", ""),
+                    current_message=self.data.get("current_message", ""),
+                    current_interval=self.data.get("interval_minutes", DEFAULT_INTERVAL),
+                    active_tries=self.data.get("active_tries", []),
+                )
 
-            # Save checkbox state regardless of which button was pressed
-            self.data["goals"]["today"] = updated_today
-            self.data["last_checkin"] = datetime.now().isoformat()
-            self._save()
-
-            if action != "edit_today":
-                break
-            current = _normalize_today(self.data["goals"].get("today", []))
-            val = show_today_task_editor("今日の細分タスクを編集", current)
-            if val is not None:
-                self.data["goals"]["today"] = val
+                # Save checkbox state regardless of which button was pressed
+                self.data["goals"]["today"] = updated_today
+                self.data["last_checkin"] = datetime.now().isoformat()
                 self._save()
+
+                if action != "edit_today":
+                    break
+                current = _normalize_today(self.data["goals"].get("today", []))
+                val = show_today_task_editor("今日の細分タスクを編集", current)
+                if val is not None:
+                    self.data["goals"]["today"] = val
+                    self._save()
+        finally:
+            nudge_timer.invalidate()
 
         if action == "break" or new_task is None:
             self._break_mode = True
