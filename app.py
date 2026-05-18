@@ -333,9 +333,14 @@ class _TodayTaskTableModel(NSObject):
                 self.items[row]["text"] = str(value or "").strip()
 
     def tableView_writeRowsWithIndexes_toPasteboard_(self, _table, row_indexes, pasteboard):
+        count = row_indexes.count()
+        idxs = []
         idx = row_indexes.firstIndex()
+        for _ in range(count):
+            idxs.append(idx)
+            idx = row_indexes.indexGreaterThanIndex_(idx)
         pasteboard.declareTypes_owner_([NSPasteboardTypeString], self)
-        pasteboard.setString_forType_(str(idx), NSPasteboardTypeString)
+        pasteboard.setString_forType_(",".join(str(i) for i in idxs), NSPasteboardTypeString)
         return True
 
     def tableView_validateDrop_proposedRow_proposedDropOperation_(self, _table, _info, _row, _op):
@@ -346,16 +351,18 @@ class _TodayTaskTableModel(NSObject):
         if raw is None:
             return False
         try:
-            src = int(raw)
+            src_set = {int(s) for s in raw.split(",")}
         except ValueError:
             return False
-        if not (0 <= src < len(self.items)):
+        moving = [self.items[i] for i in sorted(src_set) if 0 <= i < len(self.items)]
+        if not moving:
             return False
-        item = self.items.pop(src)
-        if src < row:
-            row -= 1
-        row = max(0, min(row, len(self.items)))
-        self.items.insert(row, item)
+        n_before = sum(1 for i in src_set if i < row)
+        remaining = [item for i, item in enumerate(self.items) if i not in src_set]
+        insert_at = max(0, min(row - n_before, len(remaining)))
+        for item in reversed(moving):
+            remaining.insert(insert_at, item)
+        self.items[:] = remaining
         return True
 
 
@@ -656,7 +663,7 @@ def show_today_task_editor(title: str, items: list[dict]) -> Optional[list]:
     table.addTableColumn_(col)
     table.setHeaderView_(None)
     table.setUsesAlternatingRowBackgroundColors_(True)
-    table.setAllowsMultipleSelection_(False)
+    table.setAllowsMultipleSelection_(True)
     table.setAllowsEmptySelection_(True)
     table.setDataSource_(model)
     table.setDelegate_(model)
@@ -698,11 +705,19 @@ def show_today_task_editor(title: str, items: list[dict]) -> Optional[list]:
                     NSIndexSet.indexSetWithIndex_(insert_at), False)
                 continue
             if resp == _BTN2:
-                row = table.selectedRow()
-                if row < 0 or row >= len(model.items):
+                sel = table.selectedRowIndexes()
+                if sel.count() == 0:
                     err.setStringValue_("削除する行を選択してください")
                     continue
-                model.items.pop(row)
+                count = sel.count()
+                idxs = []
+                idx = sel.firstIndex()
+                for _ in range(count):
+                    idxs.append(idx)
+                    idx = sel.indexGreaterThanIndex_(idx)
+                for idx in reversed(idxs):
+                    if 0 <= idx < len(model.items):
+                        model.items.pop(idx)
                 table.reloadData()
                 continue
             clean = []
