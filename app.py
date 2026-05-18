@@ -1826,6 +1826,19 @@ class ProgressChecker(rumps.App):
             result = show_feedback(current)
             if result == "complete":
                 notify("🎉 完了！", current, "素晴らしい！この調子で続けよう！")
+                today_items = _normalize_today(self.data["goals"].get("today", []))
+                current_idx = next(
+                    (i for i, t in enumerate(today_items) if t["text"] == current), None)
+                if current_idx is not None:
+                    today_items[current_idx]["done"] = True
+                    self.data["goals"]["today"] = today_items
+                    if not self.data.get("next_task"):
+                        next_undone = next(
+                            (t["text"] for t in today_items[current_idx + 1:] if not t["done"]),
+                            None)
+                        if next_undone:
+                            self.data["next_task"] = next_undone
+                    self._save()
             elif result == "progress":
                 notify("💪 前進中！", current, "少しでも動けたことが大切！")
             elif result == "replan":
