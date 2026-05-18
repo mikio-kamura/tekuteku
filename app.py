@@ -363,6 +363,7 @@ class _TodayTaskTableModel(NSObject):
         for item in reversed(moving):
             remaining.insert(insert_at, item)
         self.items[:] = remaining
+        _table.deselectAll_(None)
         return True
 
 
