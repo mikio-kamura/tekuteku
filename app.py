@@ -125,17 +125,106 @@ class _UiTicker(NSObject):
 _ui_ticker = _UiTicker.alloc().init()
 
 
+SAM_CLOTHING_IMG = os.path.join(os.path.dirname(__file__), "sam_clothing-eyes.png")
+
+_nudge_win_ref = [None]
+
+# NSPopUpMenuWindowLevel (101): receives clicks even during modal sessions
+_NUDGE_LEVEL = 101
+
+
+class _NudgeWindowHandler(NSObject):
+    """Handles close button and 'よし！' button for the nudge popup."""
+    def closeNudge_(self, sender):
+        w = _nudge_win_ref[0]
+        if w is not None:
+            w.orderOut_(None)
+            _nudge_win_ref[0] = None
+
+    def windowShouldClose_(self, win):
+        self.closeNudge_(None)
+        return False
+
+    def autoClose_(self, timer):
+        self.closeNudge_(None)
+
+
+_nudge_handler = _NudgeWindowHandler.alloc().init()
+
+
+def _show_nudge_popup():
+    if _nudge_win_ref[0] is not None:
+        _nudge_win_ref[0].makeKeyAndOrderFront_(None)
+        return
+
+    W, H = 280, 400
+    win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+        NSMakeRect(0, 0, W, H), 1 | 2, 2, False,
+    )
+    win.setTitle_("⏰ まだチェックインしてないのか？")
+    win.setOpaque_(False)
+    win.setBackgroundColor_(_BG)
+    win.setAppearance_(NSAppearance.appearanceNamed_("NSAppearanceNameAqua"))
+    win.setLevel_(_NUDGE_LEVEL)
+    win.setHidesOnDeactivate_(False)
+    win.setCollectionBehavior_(_WC_MANAGED | _WC_CYCLE)
+    win.setDelegate_(_nudge_handler)
+    _center_on_active_screen(win)
+
+    cv = win.contentView()
+
+    MSG_H = 80
+    BTN_H = 52
+    IMG_PAD = 10
+    IMG_H = H - MSG_H - BTN_H - IMG_PAD
+
+    _msg_cell = _VCenteredCell.alloc().initTextCell_(
+        "タスク決めようぜ。\nまず1分だけ取り組んでみようぜ"
+    )
+    _msg_cell.setFont_(NSFont.systemFontOfSize_(14))
+    _msg_cell.setWraps_(True)
+    _msg_cell.setScrollable_(False)
+    _msg_cell.setTextColor_(NSColor.colorWithWhite_alpha_(0.25, 1.0))
+    _msg_tf = NSTextField.alloc().initWithFrame_(
+        NSMakeRect(16, H - MSG_H, W - 32, MSG_H)
+    )
+    _msg_tf.setCell_(_msg_cell)
+    _msg_tf.setBezeled_(False)
+    _msg_tf.setDrawsBackground_(False)
+    _msg_tf.setEditable_(False)
+    _msg_tf.setSelectable_(False)
+    cv.addSubview_(_msg_tf)
+
+    if os.path.exists(SAM_CLOTHING_IMG):
+        img = NSImage.alloc().initByReferencingFile_(SAM_CLOTHING_IMG)
+        if img:
+            iv = NSImageView.alloc().initWithFrame_(
+                NSMakeRect(10, BTN_H, W - 20, IMG_H)
+            )
+            iv.setImage_(img)
+            iv.setImageScaling_(3)
+            iv.setImageAlignment_(5)
+            cv.addSubview_(iv)
+
+    btn = NSButton.alloc().initWithFrame_(NSMakeRect((W - 140) // 2, 12, 140, 32))
+    btn.setTitle_("よし、やろう！")
+    btn.setBezelStyle_(1)
+    btn.setTarget_(_nudge_handler)
+    btn.setAction_("closeNudge:")
+    cv.addSubview_(btn)
+
+    _nudge_win_ref[0] = win
+    win.makeKeyAndOrderFront_(None)
+
+
 class _CheckinNudger(NSObject):
-    """Fires a reminder notification every 5 minutes while the check-in dialog is open."""
+    """Shows a nudge popup every 5 minutes while the check-in dialog is open."""
     def nudge_(self, timer):
         try:
-            import subprocess
-            subprocess.Popen([
-                "osascript", "-e",
-                'display notification "タスク決めようぜ。" with title "⏰ まだチェックインしてないのか？"',
-            ])
-        except Exception:
-            pass
+            _show_nudge_popup()
+        except Exception as e:
+            import traceback
+            print(f"[nudge] error: {e}\n{traceback.format_exc()}", flush=True)
 
 
 _checkin_nudger = _CheckinNudger.alloc().init()
@@ -425,12 +514,29 @@ class _KeyWindow(NSWindow):
 _H = _Handler.alloc().init()
 
 
+def _center_on_active_screen(win: NSWindow) -> None:
+    """Center window on the screen that currently has the mouse cursor."""
+    mouse_loc = NSEvent.mouseLocation()
+    target_screen = NSScreen.mainScreen()
+    for screen in NSScreen.screens():
+        sf = screen.frame()
+        if (sf.origin.x <= mouse_loc.x < sf.origin.x + sf.size.width and
+                sf.origin.y <= mouse_loc.y < sf.origin.y + sf.size.height):
+            target_screen = screen
+            break
+    sf = target_screen.visibleFrame()
+    wf = win.frame()
+    x = sf.origin.x + (sf.size.width - wf.size.width) / 2
+    y = sf.origin.y + (sf.size.height - wf.size.height) / 2
+    win.setFrameOrigin_((x, y))
+
+
 def _make_win(title: str, w: int, h: int) -> NSWindow:
     win = _KeyWindow.alloc().initWithContentRect_styleMask_backing_defer_(
         NSMakeRect(0, 0, w, h), _STYLE, 2, False,
     )
     win.setTitle_(title)
-    win.center()
+    _center_on_active_screen(win)
     win.setDelegate_(_H)
     # Keep this window in the active Space and cycle list.
     # (Do not combine CanJoinAllSpaces with MoveToActiveSpace.)
@@ -1425,7 +1531,14 @@ class ProgressChecker(rumps.App):
             None,
             rumps.MenuItem("❌ 終了", callback=rumps.quit_application),
         ]
-        self._start_timer()
+        if self.data.get("current_task"):
+            self._start_timer()
+        else:
+            # No active session: create timer but don't start it.
+            # _next_checkin_at set far in future so watchdog never auto-fires.
+            interval = self.data.get("interval_minutes", DEFAULT_INTERVAL)
+            self._next_checkin_at = datetime.now() + timedelta(days=365)
+            self._timer = rumps.Timer(self._on_timer_fire, interval * 60)
         self._start_watchdog()
         self._start_ui_timer()
         self._install_edit_shortcuts()
@@ -1569,6 +1682,9 @@ class ProgressChecker(rumps.App):
                 continue
 
     def _update_countdown(self):
+        if not self._break_mode and not self.data.get("current_task"):
+            self.title = "🎯"
+            return
         remaining = self._next_checkin_at - datetime.now()
         total_secs = max(0, int(remaining.total_seconds()))
         mins, secs = divmod(total_secs, 60)
@@ -1749,7 +1865,6 @@ class ProgressChecker(rumps.App):
     def _autoshow_pin(self, timer: rumps.Timer):
         timer.stop()
         self._show_pin_window()
-        self._do_checkin()
 
     def _first_run(self, timer: rumps.Timer):
         timer.stop()
@@ -1971,14 +2086,22 @@ class ProgressChecker(rumps.App):
         self._pin_delegate.app_ref = self
         win.setDelegate_(self._pin_delegate)
 
-        # Position bottom-left of visible screen area
+        # Position bottom-left of active screen
         try:
-            sr = NSScreen.mainScreen().visibleFrame()
+            mouse_loc = NSEvent.mouseLocation()
+            target_screen = NSScreen.mainScreen()
+            for _s in NSScreen.screens():
+                _sf = _s.frame()
+                if (_sf.origin.x <= mouse_loc.x < _sf.origin.x + _sf.size.width and
+                        _sf.origin.y <= mouse_loc.y < _sf.origin.y + _sf.size.height):
+                    target_screen = _s
+                    break
+            sr = target_screen.visibleFrame()
             win_x = sr.origin.x + 20
             win_y = sr.origin.y + 10
             win.setFrameOrigin_((win_x, win_y))
         except Exception:
-            win.center()
+            _center_on_active_screen(win)
 
         self._pin_win = win
         win.orderFront_(None)
