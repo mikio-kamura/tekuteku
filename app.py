@@ -403,6 +403,20 @@ def _input_field(rect, font, placeholder: str = "", default: str = "") -> NSText
     return f
 
 
+class _TabTextViewDelegate(NSObject):
+    """NSTextView delegate: Tab → next key view, Shift+Tab → previous."""
+    def textView_doCommandBySelector_(self, tv, selector):
+        if selector == "insertTab:":
+            tv.window().selectNextKeyView_(tv)
+            return True
+        if selector == "insertBacktab:":
+            tv.window().selectPreviousKeyView_(tv)
+            return True
+        return False
+
+_tab_tv_delegate = _TabTextViewDelegate.alloc().init()
+
+
 def _text_view(items: List[str], rect) -> tuple:
     scroll = NSScrollView.alloc().initWithFrame_(rect)
     scroll.setHasVerticalScroller_(True)
@@ -416,6 +430,7 @@ def _text_view(items: List[str], rect) -> tuple:
     tv.setAutomaticLinkDetectionEnabled_(False)
     tv.setString_("\n".join(items))
     tv.setAutoresizingMask_(2)
+    tv.setDelegate_(_tab_tv_delegate)
     scroll.setDocumentView_(tv)
     return scroll, tv
 
@@ -818,6 +833,11 @@ def show_weekly_editor(goal: str, days: dict, week_start: str = "") -> Optional[
 
     cv.addSubview_(_sep(NSMakeRect(20, 52, W-40, 1)))
     _btn(cv, "決定", _BTN1, NSMakeRect(W-136, 12, 116, 32), primary=True)
+    ordered_day_fields = [day_fields[k] for k in WEEKDAY_NAMES]
+    goal_field.setNextKeyView_(ordered_day_fields[0])
+    for i in range(len(ordered_day_fields) - 1):
+        ordered_day_fields[i].setNextKeyView_(ordered_day_fields[i + 1])
+    ordered_day_fields[-1].setNextKeyView_(goal_field)
     win.setInitialFirstResponder_(goal_field)
     _show(win)
     try:
@@ -1154,6 +1174,10 @@ def show_checkin(
     _btn(cv, f"☕  {BREAK_MINUTES}分休憩", _BTN2, NSMakeRect(W - 312, 8, 140, 28))
     _btn(cv, "📝 細分タスク編集",          _BTN3, NSMakeRect(X + 20, 8, 128, 28))
 
+    field_next.setNextKeyView_(field_next_next)
+    field_next_next.setNextKeyView_(field_session)
+    field_session.setNextKeyView_(field_msg)
+    field_msg.setNextKeyView_(field_next)
     win.setInitialFirstResponder_(field_next)
     _show(win)
     try:
@@ -1302,7 +1326,9 @@ def show_kpt_editor(keep: list, problem: list, try_: list) -> Optional[dict]:
         text_views.append(tv)
 
     _btn(cv, "決定", _BTN1, NSMakeRect(W - 136, 12, 116, 32), primary=True)
-    win.makeFirstResponder_(text_views[0])
+    for i in range(len(text_views)):
+        text_views[i].setNextKeyView_(text_views[(i + 1) % len(text_views)])
+    win.setInitialFirstResponder_(text_views[0])
     _show(win)
     try:
         resp = NSApp.runModalForWindow_(win)
@@ -1518,7 +1544,11 @@ def show_weekly_review(
 
     _btn(cv, "スキップ", _BTN2, NSMakeRect(W-264, 12, 116, 32))
     _btn(cv, "決定", _BTN1, NSMakeRect(W-136, 12, 116, 32), primary=True)
-    win.makeFirstResponder_(text_views[0])
+    text_views[0].setNextKeyView_(text_views[1])
+    text_views[1].setNextKeyView_(text_views[2])
+    text_views[2].setNextKeyView_(summary_field)
+    summary_field.setNextKeyView_(text_views[0])
+    win.setInitialFirstResponder_(text_views[0])
     _show(win)
     try:
         resp = NSApp.runModalForWindow_(win)
