@@ -1204,12 +1204,12 @@ def show_checkin(
             if resp == _BTN3:
                 return "edit_today", None, None, None, None, updated_today
 
-            if not today_items:
+            if not updated_today:
                 err.setStringValue_("先に細分タスクを追加してください")
                 continue
 
-            next_task      = _parse_task_index(field_next.stringValue(), today_items)
-            next_next_task = _parse_task_index(field_next_next.stringValue(), today_items)
+            next_task      = _parse_task_index(field_next.stringValue(), updated_today)
+            next_next_task = _parse_task_index(field_next_next.stringValue(), updated_today)
             msg = field_msg.stringValue().strip()
 
             try:
