@@ -33,6 +33,7 @@ from AppKit import (
     NSMenu,
     NSMenuItem,
     NSEventModifierFlagCommand,
+    NSEventModifierFlagShift,
     NSPasteboardTypeString,
     NSScreen,
     NSScrollView,
@@ -615,12 +616,17 @@ class _KeyWindow(NSWindow):
     """NSWindow subclass that handles edit key equivalents directly.
     Necessary for LSUIElement apps where the main menu bar is inactive."""
     def performKeyEquivalent_(self, event):
-        if event.modifierFlags() & NSEventModifierFlagCommand:
-            sel = {"c": "copy:", "v": "paste:", "x": "cut:",
-                   "a": "selectAll:", "z": "undo:"}.get(
-                       event.charactersIgnoringModifiers())
-            if sel and NSApp.sendAction_to_from_(sel, None, None):
-                return True
+        flags = event.modifierFlags()
+        char = event.charactersIgnoringModifiers()
+        if flags & NSEventModifierFlagCommand:
+            if (flags & NSEventModifierFlagShift) and char == "z":
+                if NSApp.sendAction_to_from_("redo:", None, None):
+                    return True
+            else:
+                sel = {"c": "copy:", "v": "paste:", "x": "cut:",
+                       "a": "selectAll:", "z": "undo:"}.get(char)
+                if sel and NSApp.sendAction_to_from_(sel, None, None):
+                    return True
         return objc.super(_KeyWindow, self).performKeyEquivalent_(event)
 
 
@@ -1292,7 +1298,7 @@ def show_history(history: list) -> None:
         _hide()
 
 
-def show_kpt_editor(keep: list, problem: list, try_: list) -> Optional[dict]:
+def show_kpt_editor(keep: list, problem: list, try_: list, kpt_history: list = None) -> Optional[dict]:
     """KPT retrospective editor.
     Returns {"keep": [...], "problem": [...], "try": [...]} or None."""
     W, H = 580, 520
@@ -1326,6 +1332,14 @@ def show_kpt_editor(keep: list, problem: list, try_: list) -> Optional[dict]:
         text_views.append(tv)
 
     _btn(cv, "決定", _BTN1, NSMakeRect(W - 136, 12, 116, 32), primary=True)
+    if kpt_history is not None:
+        _kpt_hist_btn_handler.history = list(kpt_history)
+        hist_btn = NSButton.alloc().initWithFrame_(NSMakeRect(20, 12, 140, 32))
+        hist_btn.setTitle_("📊 過去を見る")
+        hist_btn.setBezelStyle_(1)
+        hist_btn.setTarget_(_kpt_hist_btn_handler)
+        hist_btn.setAction_("show:")
+        cv.addSubview_(hist_btn)
     for i in range(len(text_views)):
         text_views[i].setNextKeyView_(text_views[(i + 1) % len(text_views)])
     win.setInitialFirstResponder_(text_views[0])
@@ -1414,6 +1428,89 @@ def show_try_selector(try_items: list) -> list:
     finally:
         win.orderOut_(None)
         _hide()
+
+
+_kpt_hist_float_ref = [None]
+
+
+class _KptHistFloatHandler(NSObject):
+    """Handler for the non-modal KPT history reference window."""
+    def closeHistFloat_(self, sender):
+        w = _kpt_hist_float_ref[0]
+        if w is not None:
+            w.orderOut_(None)
+            _kpt_hist_float_ref[0] = None
+
+    def windowWillClose_(self, notif):
+        _kpt_hist_float_ref[0] = None
+
+
+_kpt_hist_float_handler = _KptHistFloatHandler.alloc().init()
+
+
+class _KptHistBtnHandler(NSObject):
+    """Button handler inside the KPT editor that shows history without stopping the modal."""
+    history = []
+
+    def show_(self, sender):
+        _show_kpt_history_float(self.history)
+
+
+_kpt_hist_btn_handler = _KptHistBtnHandler.alloc().init()
+
+
+def _show_kpt_history_float(kpt_history: list):
+    """Show KPT history as a non-modal floating window (can coexist with the editor modal)."""
+    if _kpt_hist_float_ref[0] is not None:
+        _kpt_hist_float_ref[0].makeKeyAndOrderFront_(None)
+        return
+    W, H = 500, 540
+    win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+        NSMakeRect(0, 0, W, H), 1 | 2, 2, False,
+    )
+    win.setTitle_("過去の振り返り記録")
+    win.setOpaque_(False)
+    win.setBackgroundColor_(_BG)
+    win.setAppearance_(NSAppearance.appearanceNamed_("NSAppearanceNameAqua"))
+    win.setLevel_(_NUDGE_LEVEL)
+    win.setHidesOnDeactivate_(False)
+    win.setCollectionBehavior_(_WC_MANAGED | _WC_CYCLE)
+    win.setDelegate_(_kpt_hist_float_handler)
+    _center_on_active_screen(win)
+    cv = win.contentView()
+    cv.addSubview_(_label(
+        "過去の振り返り記録",
+        NSMakeRect(20, H - 40, W - 40, 24),
+        NSFont.boldSystemFontOfSize_(15),
+        color=NSColor.colorWithWhite_alpha_(0.15, 1.0),
+    ))
+    lines: list[str] = []
+    for entry in reversed(kpt_history):
+        date = entry.get("date", "")
+        lines.append(f"─── {date} ───")
+        for section, label in (("keep", "✅ Keep"), ("problem", "⚠️ Problem"), ("try", "🚀 Try")):
+            lines.append(label)
+            items = entry.get(section, [])
+            for item in items:
+                lines.append(f"  • {item}")
+            if not items:
+                lines.append("  （なし）")
+        lines.append("")
+    if not lines:
+        lines = ["まだ振り返り記録がありません。"]
+    scroll, tv = _text_view(lines, NSMakeRect(20, 52, W - 40, H - 108))
+    tv.setEditable_(False)
+    cv.addSubview_(scroll)
+    close_btn = NSButton.alloc().initWithFrame_(NSMakeRect(W - 136, 12, 116, 32))
+    close_btn.setTitle_("閉じる")
+    close_btn.setBezelStyle_(1)
+    close_btn.setKeyEquivalent_("\r")
+    close_btn.setTarget_(_kpt_hist_float_handler)
+    close_btn.setAction_("closeHistFloat:")
+    cv.addSubview_(close_btn)
+    _kpt_hist_float_ref[0] = win
+    win.makeKeyAndOrderFront_(None)
+    win.orderFrontRegardless()
 
 
 def show_kpt_history(kpt_history: list) -> None:
@@ -2389,14 +2486,14 @@ class ProgressChecker(rumps.App):
             return
         self._checkin_active = True
         try:
-            # Pre-fill from any existing entry for this date
+            # Pre-fill only if an entry for this date already exists; otherwise start empty
             kpt_history = self.data.get("kpt_history", [])
             existing = next((e for e in kpt_history if e.get("date") == date_str), {})
-            kpt_base = existing if existing else self.data.get("kpt", {})
             result = show_kpt_editor(
-                kpt_base.get("keep", []),
-                kpt_base.get("problem", []),
-                kpt_base.get("try", []),
+                existing.get("keep", []),
+                existing.get("problem", []),
+                existing.get("try", []),
+                kpt_history=kpt_history,
             )
             if result is None:
                 return
