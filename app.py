@@ -128,6 +128,7 @@ _ui_ticker = _UiTicker.alloc().init()
 SAM_CLOTHING_IMG = os.path.join(os.path.dirname(__file__), "sam_clothing-eyes.png")
 
 _nudge_win_ref = [None]
+_checkin_win_ref = [None]
 
 # NSPopUpMenuWindowLevel (101): receives clicks even during modal sessions
 _NUDGE_LEVEL = 101
@@ -140,6 +141,13 @@ class _NudgeWindowHandler(NSObject):
         if w is not None:
             w.orderOut_(None)
             _nudge_win_ref[0] = None
+
+    def activateCheckin_(self, sender):
+        self.closeNudge_(None)
+        cw = _checkin_win_ref[0]
+        if cw is not None:
+            NSApp.activateIgnoringOtherApps_(True)
+            cw.makeKeyAndOrderFront_(None)
 
     def windowShouldClose_(self, win):
         self.closeNudge_(None)
@@ -210,7 +218,7 @@ def _show_nudge_popup():
     btn.setTitle_("よし、やろう！")
     btn.setBezelStyle_(1)
     btn.setTarget_(_nudge_handler)
-    btn.setAction_("closeNudge:")
+    btn.setAction_("activateCheckin:")
     cv.addSubview_(btn)
 
     _nudge_win_ref[0] = win
@@ -873,6 +881,7 @@ def show_checkin(
 
     W = X + 480
     win = _make_win("チェックイン", W, H)
+    _checkin_win_ref[0] = win
     cv = win.contentView()
 
     # ── 左列：サム画像（下部）+ Tryリスト（サムの真上、上部は余白）──────────
@@ -1095,6 +1104,10 @@ def show_checkin(
                 continue
             return "start", next_task, next_next_task, msg, session_mins, updated_today
     finally:
+        _checkin_win_ref[0] = None
+        if _nudge_win_ref[0] is not None:
+            _nudge_win_ref[0].orderOut_(None)
+            _nudge_win_ref[0] = None
         win.orderOut_(None)
         _hide()
 
