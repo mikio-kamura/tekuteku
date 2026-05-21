@@ -148,6 +148,7 @@ class _NudgeWindowHandler(NSObject):
         if cw is not None:
             NSApp.activateIgnoringOtherApps_(True)
             cw.makeKeyAndOrderFront_(None)
+            cw.orderFrontRegardless()
 
     def windowShouldClose_(self, win):
         self.closeNudge_(None)
