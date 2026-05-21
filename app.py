@@ -533,7 +533,12 @@ class _TodayTaskTableModel(NSObject):
             if column.identifier() == "done":
                 self.items[row]["done"] = bool(value)
             else:
-                self.items[row]["text"] = str(value or "").strip()
+                text = str(value or "").strip()
+                if self.show_numbers and text and text[0].isdigit():
+                    dot_idx = text.find(". ")
+                    if dot_idx > 0 and text[:dot_idx].isdigit():
+                        text = text[dot_idx + 2:]
+                self.items[row]["text"] = text
 
     def tableView_writeRowsWithIndexes_toPasteboard_(self, _table, row_indexes, pasteboard):
         count = row_indexes.count()
@@ -1051,7 +1056,7 @@ def show_checkin(
 
     # ── 今日やりたいこと（ドラッグで並び替え可）──────────────────────────────
     cv.addSubview_(_label(
-        f"📅  今日やりたいこと — {_date_jp(_today_dt)}",
+        f"📅  今日やりたいこと — {_date_jp(_today_dt)}  （ダブルクリックで文面を編集）",
         NSMakeRect(X + 20, today_label_y, W - X - 40, 20),
         NSFont.boldSystemFontOfSize_(13),
         color=NSColor.systemBlueColor(),
@@ -1079,7 +1084,7 @@ def show_checkin(
     # Task text column
     _task_col = NSTableColumn.alloc().initWithIdentifier_("task")
     _task_col.setWidth_(table_w - 22 - 4)
-    _task_col.setEditable_(False)
+    _task_col.setEditable_(True)
     _task_col.dataCell().setFont_(NSFont.systemFontOfSize_(13))
     today_table.addTableColumn_(_task_col)
     today_table.setHeaderView_(None)
