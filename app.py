@@ -1532,9 +1532,8 @@ def _show_kpt_history_float(kpt_history: list):
     close_btn = NSButton.alloc().initWithFrame_(NSMakeRect(W - 136, 12, 116, 32))
     close_btn.setTitle_("閉じる")
     close_btn.setBezelStyle_(1)
-    close_btn.setKeyEquivalent_("\r")
-    close_btn.setTarget_(_kpt_hist_float_handler)
-    close_btn.setAction_("closeHistFloat:")
+    close_btn.setTarget_(win)
+    close_btn.setAction_("orderOut:")
     cv.addSubview_(close_btn)
     _kpt_hist_float_ref[0] = win
     win.makeKeyAndOrderFront_(None)
