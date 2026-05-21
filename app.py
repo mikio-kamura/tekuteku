@@ -979,10 +979,12 @@ def show_checkin(
     current_message: str = "",
     current_interval: int = DEFAULT_INTERVAL,
     active_tries: Optional[list] = None,
+    weekly_tries: Optional[list] = None,
 ) -> tuple[str, Optional[str], Optional[str], Optional[str], Optional[int], list]:
     """Returns (action, next_task, next_next_task, message, session_minutes, updated_today_items).
     action is one of: start, break, edit_today."""
     active_tries = active_tries or []
+    weekly_tries = weekly_tries or []
     today_items = _normalize_today(goals.get("today", []))
     try:
         _today_dt = datetime.strptime(today_date, "%Y-%m-%d") if today_date else datetime.now()
@@ -1009,15 +1011,18 @@ def show_checkin(
     _LX = 8
     _LINE_H = 18    # height per try item row
     _ITEM_GAP = 6   # gap between items
-    _LABEL_H = 14   # "Try" heading height
+    _LABEL_H = 14   # section heading height
     _LABEL_GAP = 4  # gap between heading and first item
-    _LIST_PAD = 14  # top/bottom padding of list (> _ITEM_GAP)
+    _LIST_PAD = 14  # top/bottom padding of list
+    _SECTION_GAP = 10  # gap between 日 and 週 sections
 
-    _n_try = len(active_tries)
-    _list_content_h = (
-        _LABEL_H + _LABEL_GAP + _n_try * _LINE_H + max(0, _n_try - 1) * _ITEM_GAP
-    ) if _n_try else 0
-    _try_col_h = (2 * _LIST_PAD + _list_content_h) if _n_try else 0
+    _n_daily = len(active_tries)
+    _n_weekly = len(weekly_tries)
+    _daily_block_h = (_n_daily * _LINE_H + max(0, _n_daily - 1) * _ITEM_GAP + _LABEL_GAP + _LABEL_H) if _n_daily else 0
+    _weekly_block_h = (_n_weekly * _LINE_H + max(0, _n_weekly - 1) * _ITEM_GAP + _LABEL_GAP + _LABEL_H) if _n_weekly else 0
+    _between_h = _SECTION_GAP if (_n_daily and _n_weekly) else 0
+    _total_content_h = _daily_block_h + _between_h + _weekly_block_h
+    _try_col_h = (2 * _LIST_PAD + _total_content_h) if _total_content_h else 0
 
     _sam_h = min(int(H * 0.60), H - _try_col_h - _LX * 2)
     _sam_h = max(_sam_h, 40)
@@ -1031,28 +1036,46 @@ def show_checkin(
             iv.setImageAlignment_(5)
             cv.addSubview_(iv)
 
-    if active_tries:
+    if _n_daily or _n_weekly:
         _sam_top = _LX + _sam_h
-        # Bullet items: i=0 topmost, i=N-1 closest to Sam
-        for _ti, _try_text in enumerate(active_tries):
-            _item_y = _sam_top + _LIST_PAD + (_n_try - 1 - _ti) * (_LINE_H + _ITEM_GAP)
-            cv.addSubview_(_mlabel(
-                f"・{_try_text}",
-                NSMakeRect(_LX, _item_y, X - _LX * 2, _LINE_H),
-                NSFont.systemFontOfSize_(13),
-                color=NSColor.colorWithWhite_alpha_(0.55, 1.0),
+        _base_daily = _sam_top + _LIST_PAD
+        _base_weekly = _base_daily + _daily_block_h + _between_h
+
+        # 日 Try section (closest to Sam)
+        if _n_daily:
+            _daily_items_h = _n_daily * _LINE_H + max(0, _n_daily - 1) * _ITEM_GAP
+            for _ti, _try_text in enumerate(active_tries):
+                _item_y = _base_daily + (_n_daily - 1 - _ti) * (_LINE_H + _ITEM_GAP)
+                cv.addSubview_(_mlabel(
+                    f"・{_try_text}",
+                    NSMakeRect(_LX, _item_y, X - _LX * 2, _LINE_H),
+                    NSFont.systemFontOfSize_(13),
+                    color=NSColor.colorWithWhite_alpha_(0.55, 1.0),
+                ))
+            cv.addSubview_(_label(
+                "日 Try",
+                NSMakeRect(_LX, _base_daily + _daily_items_h + _LABEL_GAP, X - _LX * 2, _LABEL_H),
+                NSFont.boldSystemFontOfSize_(11),
+                color=NSColor.colorWithWhite_alpha_(0.40, 1.0),
             ))
-        # "Try" heading above the items
-        _heading_y = (
-            _sam_top + _LIST_PAD
-            + _n_try * _LINE_H + max(0, _n_try - 1) * _ITEM_GAP + _LABEL_GAP
-        )
-        cv.addSubview_(_label(
-            "Try",
-            NSMakeRect(_LX, _heading_y, X - _LX * 2, _LABEL_H),
-            NSFont.boldSystemFontOfSize_(11),
-            color=NSColor.colorWithWhite_alpha_(0.40, 1.0),
-        ))
+
+        # 週 Try section (above 日 section)
+        if _n_weekly:
+            _weekly_items_h = _n_weekly * _LINE_H + max(0, _n_weekly - 1) * _ITEM_GAP
+            for _ti, _try_text in enumerate(weekly_tries):
+                _item_y = _base_weekly + (_n_weekly - 1 - _ti) * (_LINE_H + _ITEM_GAP)
+                cv.addSubview_(_mlabel(
+                    f"・{_try_text}",
+                    NSMakeRect(_LX, _item_y, X - _LX * 2, _LINE_H),
+                    NSFont.systemFontOfSize_(13),
+                    color=NSColor.colorWithWhite_alpha_(0.45, 1.0),
+                ))
+            cv.addSubview_(_label(
+                "週 Try",
+                NSMakeRect(_LX, _base_weekly + _weekly_items_h + _LABEL_GAP, X - _LX * 2, _LABEL_H),
+                NSFont.boldSystemFontOfSize_(11),
+                color=NSColor.colorWithWhite_alpha_(0.35, 1.0),
+            ))
 
     # ── 今日やりたいこと（ドラッグで並び替え可）──────────────────────────────
     cv.addSubview_(_label(
@@ -2222,6 +2245,8 @@ class ProgressChecker(rumps.App):
         NSRunLoop.mainRunLoop().addTimer_forMode_(nudge_timer, "NSModalPanelRunLoopMode")
         try:
             while True:
+                _wr_history = self.data.get("weekly_review_history", [])
+                _weekly_tries = _wr_history[-1]["kpt"].get("try", []) if _wr_history else []
                 action, new_task, queued_next_task, message, session_mins, updated_today = show_checkin(
                     self.data["goals"],
                     today_date=self.data.get("today_date", ""),
@@ -2231,6 +2256,7 @@ class ProgressChecker(rumps.App):
                     current_message=self.data.get("current_message", ""),
                     current_interval=self.data.get("interval_minutes", DEFAULT_INTERVAL),
                     active_tries=self.data.get("active_tries", []),
+                    weekly_tries=_weekly_tries,
                 )
 
                 # Save checkbox state regardless of which button was pressed
