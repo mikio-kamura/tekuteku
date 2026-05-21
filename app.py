@@ -238,6 +238,95 @@ class _CheckinNudger(NSObject):
 _checkin_nudger = _CheckinNudger.alloc().init()
 CHECKIN_NUDGE_INTERVAL = 5 * 60  # seconds
 
+# Hours at which the daily retrospective reminder fires
+RETRO_REMINDER_HOURS = [19, 22, 0]
+
+_retro_nudge_win_ref = [None]
+
+
+class _RetroNudgeHandler(NSObject):
+    """Handles the daily retrospective reminder popup."""
+    app_ref = None
+    date_ref = [""]  # date string this popup is for
+
+    def dismiss_(self, sender):
+        w = _retro_nudge_win_ref[0]
+        if w is not None:
+            w.orderOut_(None)
+            _retro_nudge_win_ref[0] = None
+
+    def doRetro_(self, sender):
+        self.dismiss_(None)
+        app = self.app_ref
+        if app is not None:
+            rumps.Timer(lambda t: (t.stop(), app._do_retrospective_for(self.date_ref[0])), 0.1).start()
+
+    def windowShouldClose_(self, win):
+        self.dismiss_(None)
+        return False
+
+
+_retro_nudge_handler = _RetroNudgeHandler.alloc().init()
+
+
+def _show_retro_nudge_popup(app_ref, date_str: str, is_yesterday: bool = False):
+    if _retro_nudge_win_ref[0] is not None:
+        _retro_nudge_win_ref[0].makeKeyAndOrderFront_(None)
+        return
+    _retro_nudge_handler.app_ref = app_ref
+    _retro_nudge_handler.date_ref[0] = date_str
+
+    W, H = 300, 160
+    win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+        NSMakeRect(0, 0, W, H), 1 | 2, 2, False,
+    )
+    if is_yesterday:
+        win.setTitle_("📝 昨日の振り返りが未完了です")
+        msg = "昨日の振り返り（KPT）が\nまだできていません。"
+    else:
+        win.setTitle_("📝 振り返りの時間です")
+        msg = "今日の振り返り（KPT）を\n記録しましょう！"
+    win.setOpaque_(False)
+    win.setBackgroundColor_(_BG)
+    win.setAppearance_(NSAppearance.appearanceNamed_("NSAppearanceNameAqua"))
+    win.setLevel_(_NUDGE_LEVEL)
+    win.setHidesOnDeactivate_(False)
+    win.setCollectionBehavior_(_WC_MANAGED | _WC_CYCLE)
+    win.setDelegate_(_retro_nudge_handler)
+    _center_on_active_screen(win)
+
+    cv = win.contentView()
+    _msg_cell = _VCenteredCell.alloc().initTextCell_(msg)
+    _msg_cell.setFont_(NSFont.systemFontOfSize_(14))
+    _msg_cell.setWraps_(True)
+    _msg_cell.setScrollable_(False)
+    _msg_cell.setTextColor_(NSColor.colorWithWhite_alpha_(0.2, 1.0))
+    msg_tf = NSTextField.alloc().initWithFrame_(NSMakeRect(16, 60, W - 32, 88))
+    msg_tf.setCell_(_msg_cell)
+    msg_tf.setBezeled_(False)
+    msg_tf.setDrawsBackground_(False)
+    msg_tf.setEditable_(False)
+    msg_tf.setSelectable_(False)
+    cv.addSubview_(msg_tf)
+
+    btn_yes = NSButton.alloc().initWithFrame_(NSMakeRect(W - 230, 12, 100, 32))
+    btn_yes.setTitle_("今やる！")
+    btn_yes.setBezelStyle_(1)
+    btn_yes.setTarget_(_retro_nudge_handler)
+    btn_yes.setAction_("doRetro:")
+    btn_yes.setKeyEquivalent_("\r")
+    cv.addSubview_(btn_yes)
+
+    btn_later = NSButton.alloc().initWithFrame_(NSMakeRect(W - 120, 12, 100, 32))
+    btn_later.setTitle_("後で")
+    btn_later.setBezelStyle_(1)
+    btn_later.setTarget_(_retro_nudge_handler)
+    btn_later.setAction_("dismiss:")
+    cv.addSubview_(btn_later)
+
+    _retro_nudge_win_ref[0] = win
+    win.makeKeyAndOrderFront_(None)
+
 
 def _schedule_icon():
     """Schedule icon re-application in NSRunLoopCommonModes so it fires even inside modal loops."""
@@ -1564,6 +1653,7 @@ class ProgressChecker(rumps.App):
             rumps.Timer(self._first_run, 1).start()
         else:
             rumps.Timer(self._autoshow_pin, 0.5).start()
+            rumps.Timer(self._prompt_missed_retro, 3).start()
 
     # ── Persistence ───────────────────────────────────────────────────────
 
@@ -1590,6 +1680,7 @@ class ProgressChecker(rumps.App):
                 data.setdefault("active_tries", [])
                 data.setdefault("today_date", datetime.now().strftime("%Y-%m-%d"))
                 data.setdefault("history", [])
+                data.setdefault("retro_reminded", {"date": "", "hours": []})
                 return data
             except Exception:
                 pass
@@ -1745,6 +1836,7 @@ class ProgressChecker(rumps.App):
             return
         self._check_date_change()
         self._check_week_change()
+        self._check_retro_reminder()
 
     def _add_to_history(self, date: str, tasks: list):
         if not date or not tasks:
@@ -1779,10 +1871,13 @@ class ProgressChecker(rumps.App):
         ]
         self.data["today_date"] = today_str
         self.data["goals"]["today"] = scheduled + carryover
+        # Reset daily retro reminder tracking for the new day
+        self.data["retro_reminded"] = {"date": today_str, "hours": []}
         self._save()
         self._check_week_change()
         if not self._checkin_active:
             rumps.Timer(self._prompt_new_day, 2).start()
+            rumps.Timer(self._prompt_missed_retro, 4).start()
 
     def _check_week_change(self):
         today_str = self.data.get("today_date", datetime.now().strftime("%Y-%m-%d"))
@@ -2212,35 +2307,89 @@ class ProgressChecker(rumps.App):
         finally:
             self._checkin_active = False
 
-    def _cmd_do_retrospective(self, _):
+    def _check_retro_reminder(self):
+        """Fire retrospective reminder popup at scheduled hours if KPT not yet done today."""
+        if self._checkin_active:
+            return
+        now = datetime.now()
+        today_str = self.data.get("today_date", now.strftime("%Y-%m-%d"))
+        hour = now.hour
+        reminded = self.data.setdefault("retro_reminded", {"date": today_str, "hours": []})
+        if reminded.get("date") != today_str:
+            reminded["date"] = today_str
+            reminded["hours"] = []
+        if hour not in RETRO_REMINDER_HOURS:
+            return
+        if hour in reminded.get("hours", []):
+            return
+        # Check if already done today
+        kpt_history = self.data.get("kpt_history", [])
+        if any(e.get("date") == today_str for e in kpt_history):
+            reminded["hours"].append(hour)
+            self._save()
+            return
+        reminded["hours"].append(hour)
+        self._save()
+        rumps.Timer(lambda t: (t.stop(), _show_retro_nudge_popup(self, today_str, False)), 1).start()
+
+    def _prompt_missed_retro(self, timer: rumps.Timer):
+        """On startup or date change: prompt for yesterday's retro if it was skipped."""
+        timer.stop()
+        if self._checkin_active:
+            return
+        today_str = self.data.get("today_date", datetime.now().strftime("%Y-%m-%d"))
+        try:
+            today_dt = datetime.strptime(today_str, "%Y-%m-%d")
+            yesterday_str = (today_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+        except ValueError:
+            return
+        kpt_history = self.data.get("kpt_history", [])
+        if any(e.get("date") == yesterday_str for e in kpt_history):
+            return
+        # Only prompt if yesterday exists in task history (i.e. we actually used the app)
+        task_history = self.data.get("history", [])
+        if not any(e.get("date") == yesterday_str for e in task_history):
+            return
+        _show_retro_nudge_popup(self, yesterday_str, is_yesterday=True)
+
+    def _do_retrospective_for(self, date_str: str):
+        """Run the KPT editor and save the result for the given date."""
         if self._checkin_active:
             return
         self._checkin_active = True
         try:
-            kpt = self.data.get("kpt", {})
+            # Pre-fill from any existing entry for this date
+            kpt_history = self.data.get("kpt_history", [])
+            existing = next((e for e in kpt_history if e.get("date") == date_str), {})
+            kpt_base = existing if existing else self.data.get("kpt", {})
             result = show_kpt_editor(
-                kpt.get("keep", []),
-                kpt.get("problem", []),
-                kpt.get("try", []),
+                kpt_base.get("keep", []),
+                kpt_base.get("problem", []),
+                kpt_base.get("try", []),
             )
             if result is None:
                 return
-            result["date"] = self.data.get("today_date", datetime.now().strftime("%Y-%m-%d"))
-            self.data["kpt"] = result
+            result["date"] = date_str
             # Upsert into kpt_history
-            history = self.data.setdefault("kpt_history", [])
-            for i, entry in enumerate(history):
-                if entry.get("date") == result["date"]:
-                    history[i] = dict(result)
+            for i, entry in enumerate(kpt_history):
+                if entry.get("date") == date_str:
+                    kpt_history[i] = dict(result)
                     break
             else:
-                history.append(dict(result))
-            # Ask which Try items to carry forward to tomorrow's check-ins
-            selected = show_try_selector(result.get("try", []))
-            self.data["active_tries"] = selected
+                kpt_history.append(dict(result))
+            # Update current kpt only if this is today
+            today_str = self.data.get("today_date", datetime.now().strftime("%Y-%m-%d"))
+            if date_str == today_str:
+                self.data["kpt"] = result
+                selected = show_try_selector(result.get("try", []))
+                self.data["active_tries"] = selected
             self._save()
         finally:
             self._checkin_active = False
+
+    def _cmd_do_retrospective(self, _):
+        today_str = self.data.get("today_date", datetime.now().strftime("%Y-%m-%d"))
+        self._do_retrospective_for(today_str)
 
     def _cmd_show_kpt_history(self, _):
         if self._checkin_active:
