@@ -67,6 +67,7 @@ _WC_MANAGED = 1 << 2
 _WC_CYCLE   = 1 << 5
 # Modal return codes
 _BTN1, _BTN2, _BTN3 = 1000, 1001, 1002
+_BTN4 = 1003
 _CANCEL = -1
 
 _BG = NSColor.colorWithRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.93)
@@ -454,6 +455,11 @@ def _truncate10(text: str) -> str:
     return s if len(s) <= 10 else s[:10] + "…"
 
 
+def _truncate8(text: str) -> str:
+    s = text or ""
+    return s if len(s) <= 8 else s[:8] + "…"
+
+
 # ── Week helpers ──────────────────────────────────────────────────────────────
 
 def _monday_of(d: datetime) -> datetime:
@@ -496,6 +502,25 @@ def _parse_day_tasks(raw) -> list[str]:
                 out.append((item.get("text") or "").strip())
         return [s for s in out if s]
     return []
+
+
+def _arrival_color(time_str: str):
+    """Map 'HH:MM' arrival time to an NSColor. Earlier = darker green."""
+    from AppKit import NSColor as _NSColor
+    try:
+        h, m = map(int, time_str.split(":"))
+    except (ValueError, AttributeError):
+        return _NSColor.colorWithRed_green_blue_alpha_(0.60, 0.82, 0.64, 1.0)
+    mins = h * 60 + m
+    # (R, G, B) solid colors, dark → light green
+    if mins < 10 * 60:  r, g, b = 0.07, 0.36, 0.16   # #0d5c28 very dark
+    elif mins < 14 * 60: r, g, b = 0.13, 0.43, 0.22  # #216e39 dark
+    elif mins < 16 * 60: r, g, b = 0.26, 0.57, 0.35  # medium
+    elif mins < 18 * 60: r, g, b = 0.40, 0.70, 0.48  # medium-light
+    elif mins < 21 * 60: r, g, b = 0.55, 0.80, 0.60  # light green
+    elif mins < 23 * 60: r, g, b = 0.68, 0.88, 0.72  # very light green
+    else:                r, g, b = 0.78, 0.92, 0.80  # pale green (still clearly green)
+    return _NSColor.colorWithRed_green_blue_alpha_(r, g, b, 1.0)
 
 
 def _styled_task_title(text: str, done: bool) -> NSAttributedString:
@@ -879,8 +904,9 @@ def _parse_task_index(raw: str, tasks: list[dict]) -> Optional[str]:
     return None
 
 
-def show_today_task_editor(title: str, items: list[dict]) -> Optional[list]:
-    """Task editor with add/delete and drag & drop reorder."""
+def show_today_task_editor(title: str, items: list[dict]) -> Optional[tuple]:
+    """Task editor with add/delete/defer and drag & drop reorder.
+    Returns (kept_items, deferred_items) or None if cancelled."""
     W, H = 520, 360
     win = _make_win(title, W, H)
     cv = win.contentView()
@@ -915,12 +941,14 @@ def show_today_task_editor(title: str, items: list[dict]) -> Optional[list]:
 
     _btn(cv, "追加", _BTN3, NSMakeRect(W - 140, 58, 60, 30))
     _btn(cv, "削除", _BTN2, NSMakeRect(W - 74, 58, 54, 30))
+    _btn(cv, "📅 翌日に移動", _BTN4, NSMakeRect(20, 10, 128, 28))
     _btn(cv, "決定", _BTN1, NSMakeRect(W - 136, 10, 116, 28), primary=False)
     # Enter in input field should add item, not submit dialog.
     input_field.setTag_(_BTN3)
     input_field.setTarget_(_H)
     input_field.setAction_("click:")
     win.setInitialFirstResponder_(input_field)
+    deferred_items: list = []
     _show(win)
     try:
         while True:
@@ -956,12 +984,34 @@ def show_today_task_editor(title: str, items: list[dict]) -> Optional[list]:
                         model.items.pop(idx)
                 table.reloadData()
                 continue
+            if resp == _BTN4:
+                sel = table.selectedRowIndexes()
+                if sel.count() == 0:
+                    err.setStringValue_("翌日に移動する行を選択してください")
+                    continue
+                count = sel.count()
+                idxs = []
+                idx = sel.firstIndex()
+                for _ in range(count):
+                    idxs.append(idx)
+                    idx = sel.indexGreaterThanIndex_(idx)
+                for idx in reversed(idxs):
+                    if 0 <= idx < len(model.items):
+                        deferred_items.append(model.items.pop(idx))
+                err.setStringValue_(f"翌日に移動しました（{len(deferred_items)}件）")
+                table.reloadData()
+                continue
             clean = []
             for item in model.items:
                 text = (item.get("text") or "").strip()
                 if text:
                     clean.append({"text": text, "done": bool(item.get("done", False))})
-            return clean
+            deferred_clean = [
+                {"text": (item.get("text") or "").strip(), "done": False}
+                for item in deferred_items
+                if (item.get("text") or "").strip()
+            ]
+            return clean, deferred_clean
     finally:
         win.orderOut_(None)
         _hide()
@@ -975,13 +1025,13 @@ def show_checkin(
     today_date: str = "",
     current_task: str = "",
     queued_task: str = "",
-    queued_next_task: str = "",
+
     current_message: str = "",
     current_interval: int = DEFAULT_INTERVAL,
     active_tries: Optional[list] = None,
     weekly_tries: Optional[list] = None,
 ) -> tuple[str, Optional[str], Optional[str], Optional[str], Optional[int], list]:
-    """Returns (action, next_task, next_next_task, message, session_minutes, updated_today_items).
+    """Returns (action, next_task, parallel_task, message, session_minutes, updated_today_items).
     action is one of: start, break, edit_today."""
     active_tries = active_tries or []
     weekly_tries = weekly_tries or []
@@ -1172,15 +1222,13 @@ def show_checkin(
 
     # ── 次回/次々回の選択 + セッション時間 + メッセージ ──────────────────────
     cv.addSubview_(_label("次のセッション", NSMakeRect(X + 20,  132, 95, 16), NSFont.systemFontOfSize_(12)))
-    cv.addSubview_(_label("その次（任意）", NSMakeRect(X + 123, 132, 95, 16), NSFont.systemFontOfSize_(12)))
+    cv.addSubview_(_label("同時タスク（任意）", NSMakeRect(X + 123, 132, 100, 16), NSFont.systemFontOfSize_(12)))
     cv.addSubview_(_label("⏱分",           NSMakeRect(X + 230, 132, 40, 16), NSFont.systemFontOfSize_(12)))
 
     default_next = ""
-    default_next_next = ""
     if today_items:
         task_to_index = {item["text"]: str(i + 1) for i, item in enumerate(today_items)}
         default_next = task_to_index.get(queued_task, "")
-        default_next_next = task_to_index.get(queued_next_task, "")
         if not default_next:
             for i, item in enumerate(today_items):
                 if not item["done"]:
@@ -1190,7 +1238,7 @@ def show_checkin(
             default_next = "1"
 
     field_next     = _input_field(NSMakeRect(X + 20,  112, 95, 26), NSFont.systemFontOfSize_(15), placeholder="番号", default=default_next)
-    field_next_next= _input_field(NSMakeRect(X + 123, 112, 95, 26), NSFont.systemFontOfSize_(15), placeholder="任意", default=default_next_next)
+    field_next_next= _input_field(NSMakeRect(X + 123, 112, 95, 26), NSFont.systemFontOfSize_(15), placeholder="番号", default="")
     field_session  = _input_field(NSMakeRect(X + 230, 112, 56, 26), NSFont.systemFontOfSize_(15), default=str(current_interval))
     cv.addSubview_(field_next)
     cv.addSubview_(field_next_next)
@@ -1232,7 +1280,7 @@ def show_checkin(
                 continue
 
             next_task      = _parse_task_index(field_next.stringValue(), updated_today)
-            next_next_task = _parse_task_index(field_next_next.stringValue(), updated_today)
+            parallel_task  = _parse_task_index(field_next_next.stringValue(), updated_today)
             msg = field_msg.stringValue().strip()
 
             try:
@@ -1247,10 +1295,10 @@ def show_checkin(
             if not next_task:
                 err.setStringValue_("次のセッションの番号を入力してください")
                 continue
-            if field_next_next.stringValue().strip() and not next_next_task:
-                err.setStringValue_("その次の番号が不正です")
+            if field_next_next.stringValue().strip() and not parallel_task:
+                err.setStringValue_("同時タスクの番号が不正です")
                 continue
-            return "start", next_task, next_next_task, msg, session_mins, updated_today
+            return "start", next_task, parallel_task, msg, session_mins, updated_today
     finally:
         _checkin_win_ref[0] = None
         if _nudge_win_ref[0] is not None:
@@ -1260,13 +1308,25 @@ def show_checkin(
         _hide()
 
 
-def show_feedback(task: str) -> str:
-    W, H = 420, 172
+def show_feedback(task: str, parallel_task: str = "") -> tuple:
+    """Returns (result_str, parallel_done_bool)."""
+    W = 420
+    H = 210 if parallel_task else 172
     win = _make_win("セッション振り返り", W, H)
     cv = win.contentView()
     short = (task[:44] + "…") if len(task) > 44 else task
-    cv.addSubview_(_mlabel(f"「{short}」", NSMakeRect(20, 120, W-40, 38), NSFont.boldSystemFontOfSize_(16)))
-    cv.addSubview_(_label("どのくらい進みましたか？", NSMakeRect(20, 90, W-40, 22), NSFont.systemFontOfSize_(13)))
+    cv.addSubview_(_mlabel(f"「{short}」", NSMakeRect(20, H - 52, W-40, 38), NSFont.boldSystemFontOfSize_(16)))
+    cv.addSubview_(_label("どのくらい進みましたか？", NSMakeRect(20, H - 82, W-40, 22), NSFont.systemFontOfSize_(13)))
+
+    parallel_check = None
+    if parallel_task:
+        short_p = (parallel_task[:36] + "…") if len(parallel_task) > 36 else parallel_task
+        parallel_check = NSButton.alloc().initWithFrame_(NSMakeRect(20, 94, W - 40, 24))
+        parallel_check.setButtonType_(3)  # NSSwitchButton = checkbox
+        parallel_check.setTitle_(f"並行「{short_p}」も完了")
+        parallel_check.setState_(0)
+        cv.addSubview_(parallel_check)
+
     bw = (W - 40 - 16) // 3
     _btn(cv, "✅  完了！",     _BTN1, NSMakeRect(20,            16, bw, 36))
     _btn(cv, "🌱  少し進んだ", _BTN2, NSMakeRect(20 + bw + 8,   16, bw, 36))
@@ -1274,7 +1334,9 @@ def show_feedback(task: str) -> str:
     _show(win)
     try:
         resp = NSApp.runModalForWindow_(win)
-        return {_BTN1: "complete", _BTN2: "progress", _BTN3: "replan"}.get(resp, "progress")
+        parallel_done = bool(parallel_check and parallel_check.state() == 1)
+        result = {_BTN1: "complete", _BTN2: "progress", _BTN3: "replan"}.get(resp, "progress")
+        return result, parallel_done
     finally:
         win.orderOut_(None)
         _hide()
@@ -1739,6 +1801,292 @@ def show_weekly_review_history(weekly_reviews: list) -> None:
         _hide()
 
 
+_lab_reminder_win_ref = [None]
+
+
+class _LabReminderHandler(NSObject):
+    app_ref = None
+
+    def dismiss_(self, sender):
+        w = _lab_reminder_win_ref[0]
+        if w is not None:
+            w.orderOut_(None)
+            _lab_reminder_win_ref[0] = None
+
+    def doRecord_(self, sender):
+        self.dismiss_(None)
+        app = self.app_ref
+        if app is not None:
+            rumps.Timer(lambda t: (t.stop(), app._cmd_record_lab_arrival(None)), 0.1).start()
+
+    def windowShouldClose_(self, win):
+        self.dismiss_(None)
+        return False
+
+
+_lab_reminder_handler = _LabReminderHandler.alloc().init()
+
+
+def _show_lab_reminder_popup(app_ref):
+    if _lab_reminder_win_ref[0] is not None:
+        _lab_reminder_win_ref[0].makeKeyAndOrderFront_(None)
+        return
+    _lab_reminder_handler.app_ref = app_ref
+
+    W, H = 310, 130
+    win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+        NSMakeRect(0, 0, W, H), 1 | 2, 2, False,
+    )
+    win.setTitle_("🏢 ラボへ着きましたか？")
+    win.setOpaque_(False)
+    win.setBackgroundColor_(_BG)
+    win.setAppearance_(NSAppearance.appearanceNamed_("NSAppearanceNameAqua"))
+    win.setLevel_(_NUDGE_LEVEL)
+    win.setHidesOnDeactivate_(False)
+    win.setCollectionBehavior_(_WC_MANAGED | _WC_CYCLE)
+    win.setDelegate_(_lab_reminder_handler)
+    _center_on_active_screen(win)
+
+    cv = win.contentView()
+    _mc = _VCenteredCell.alloc().initTextCell_("ラボに行く予定でしたが、\n到着記録がありません。")
+    _mc.setFont_(NSFont.systemFontOfSize_(13))
+    _mc.setWraps_(True)
+    _mc.setScrollable_(False)
+    _mc.setTextColor_(NSColor.colorWithWhite_alpha_(0.25, 1.0))
+    _mt = NSTextField.alloc().initWithFrame_(NSMakeRect(16, 56, W - 32, 62))
+    _mt.setCell_(_mc)
+    _mt.setBezeled_(False)
+    _mt.setDrawsBackground_(False)
+    _mt.setEditable_(False)
+    _mt.setSelectable_(False)
+    cv.addSubview_(_mt)
+
+    btn_r = NSButton.alloc().initWithFrame_(NSMakeRect(W - 252, 12, 120, 32))
+    btn_r.setTitle_("到着を記録する")
+    btn_r.setBezelStyle_(1)
+    btn_r.setTarget_(_lab_reminder_handler)
+    btn_r.setAction_("doRecord:")
+    btn_r.setKeyEquivalent_("\r")
+    cv.addSubview_(btn_r)
+
+    btn_l = NSButton.alloc().initWithFrame_(NSMakeRect(W - 124, 12, 104, 32))
+    btn_l.setTitle_("あとで")
+    btn_l.setBezelStyle_(1)
+    btn_l.setTarget_(_lab_reminder_handler)
+    btn_l.setAction_("dismiss:")
+    cv.addSubview_(btn_l)
+
+    _lab_reminder_win_ref[0] = win
+    NSApp.activateIgnoringOtherApps_(True)
+    win.makeKeyAndOrderFront_(None)
+    win.orderFrontRegardless()
+
+
+def show_lab_arrival_dialog(today_str: str, current_data: dict) -> Optional[dict]:
+    """Dialog to record lab arrival status for today.
+    Returns {"status": "arrived", "time": "HH:MM"} | {"status": "not_going"} |
+            {"status": "pending"} | None (cancelled)."""
+    W, H = 400, 210
+    win = _make_win("🏢 ラボ到着を記録", W, H)
+    cv = win.contentView()
+
+    try:
+        dt = datetime.strptime(today_str, "%Y-%m-%d")
+        date_label = _date_jp(dt)
+    except (ValueError, TypeError):
+        date_label = today_str
+
+    cv.addSubview_(_label(
+        f"ラボ到着記録 — {date_label}",
+        NSMakeRect(20, 184, W - 40, 22),
+        NSFont.boldSystemFontOfSize_(13),
+    ))
+
+    status = current_data.get("status", "")
+    time_val = current_data.get("time", "")
+    if status == "arrived" and time_val:
+        status_text = f"現在の記録: {time_val} 着"
+    elif status == "not_going":
+        status_text = "現在の記録: 今日は行かない"
+    elif status == "pending":
+        status_text = "現在の記録: 行く予定（未到着）"
+    else:
+        status_text = "現在の記録: 未記録"
+
+    cv.addSubview_(_label(
+        status_text,
+        NSMakeRect(20, 164, W - 40, 16),
+        NSFont.systemFontOfSize_(12),
+        color=NSColor.colorWithWhite_alpha_(0.5, 1.0),
+    ))
+    cv.addSubview_(_sep(NSMakeRect(20, 156, W - 40, 1)))
+
+    cv.addSubview_(_label("到着時刻を入力:", NSMakeRect(20, 132, 110, 16), NSFont.systemFontOfSize_(12)))
+    default_time = time_val if time_val else datetime.now().strftime("%H:%M")
+    time_field = _input_field(
+        NSMakeRect(132, 128, 72, 22), NSFont.systemFontOfSize_(13),
+        placeholder="HH:MM", default=default_time,
+    )
+    cv.addSubview_(time_field)
+
+    err = _label("", NSMakeRect(20, 108, W - 40, 16), NSFont.systemFontOfSize_(12),
+                 color=NSColor.systemOrangeColor())
+    cv.addSubview_(err)
+    cv.addSubview_(_sep(NSMakeRect(20, 100, W - 40, 1)))
+
+    _btn(cv, "今着いた！", _BTN1, NSMakeRect(20, 64, 110, 28))
+    _btn(cv, "時刻を記録", _BTN3, NSMakeRect(138, 64, 110, 28))
+    cv.addSubview_(_sep(NSMakeRect(20, 54, W - 40, 1)))
+
+    _btn(cv, "まだ（行く予定）", _BTN2, NSMakeRect(20, 14, 136, 28))
+    btn4 = NSButton.alloc().initWithFrame_(NSMakeRect(164, 14, 136, 28))
+    btn4.setTitle_("今日は行かない")
+    btn4.setBezelStyle_(1)
+    btn4.setTag_(_BTN4)
+    btn4.setTarget_(_H)
+    btn4.setAction_("click:")
+    cv.addSubview_(btn4)
+
+    win.setInitialFirstResponder_(time_field)
+    _show(win)
+    try:
+        while True:
+            resp = NSApp.runModalForWindow_(win)
+            if resp == _CANCEL:
+                return None
+            if resp == _BTN1:
+                return {"status": "arrived", "time": datetime.now().strftime("%H:%M")}
+            if resp == _BTN2:
+                return {"status": "pending"}
+            if resp == _BTN4:
+                return {"status": "not_going"}
+            raw = time_field.stringValue().strip()
+            try:
+                parts = raw.split(":")
+                if len(parts) != 2:
+                    raise ValueError
+                h_v, m_v = int(parts[0]), int(parts[1])
+                if not (0 <= h_v <= 23 and 0 <= m_v <= 59):
+                    raise ValueError
+                return {"status": "arrived", "time": f"{h_v:02d}:{m_v:02d}"}
+            except (ValueError, IndexError):
+                err.setStringValue_("HH:MM 形式で入力してください（例: 09:30）")
+    finally:
+        win.orderOut_(None)
+        _hide()
+
+
+def show_lab_history_view(lab_arrivals: dict) -> None:
+    """GitHub contribution-style grass calendar showing lab arrival history."""
+    CELL = 11
+    GAP = 2
+    STEP = CELL + GAP
+    WEEKS = 52
+    DAYS = 7
+    LEFT_MARGIN = 28
+    grid_base_y = 52        # y of bottom row (Sunday)
+    grid_h = DAYS * STEP    # 91
+    month_label_y = grid_base_y + grid_h + 4   # 147
+    title_y = month_label_y + 16 + 6           # 169
+
+    W = LEFT_MARGIN + WEEKS * STEP + 24        # 728
+    H = title_y + 26                           # 195
+
+    win = _make_win("📊 ラボ出席カレンダー", W, H)
+    cv = win.contentView()
+
+    cv.addSubview_(_label(
+        "ラボ出席カレンダー（過去1年間）",
+        NSMakeRect(LEFT_MARGIN, title_y, W - LEFT_MARGIN - 20, 22),
+        NSFont.boldSystemFontOfSize_(13),
+    ))
+
+    today = datetime.now().date()
+    current_monday = today - timedelta(days=today.weekday())
+    grid_start = current_monday - timedelta(weeks=WEEKS - 1)
+
+    shown_months: set = set()
+
+    def _grass_cell(rect, bg_color, tooltip=""):
+        c = NSTextField.alloc().initWithFrame_(rect)
+        c.setBezeled_(False)
+        c.setEditable_(False)
+        c.setSelectable_(False)
+        c.setDrawsBackground_(True)
+        c.setStringValue_("")
+        c.setBackgroundColor_(bg_color)
+        if tooltip:
+            c.setToolTip_(tooltip)
+        return c
+
+    for week in range(WEEKS):
+        for day in range(DAYS):
+            cell_date = grid_start + timedelta(weeks=week, days=day)
+            date_str = cell_date.strftime("%Y-%m-%d")
+            x = LEFT_MARGIN + week * STEP
+            y = grid_base_y + (DAYS - 1 - day) * STEP
+
+            if cell_date.day <= 7 and cell_date.month not in shown_months and week < WEEKS - 1:
+                shown_months.add(cell_date.month)
+                cv.addSubview_(_label(
+                    f"{cell_date.month}月",
+                    NSMakeRect(x, month_label_y, 22, 14),
+                    NSFont.systemFontOfSize_(10),
+                    color=NSColor.colorWithWhite_alpha_(0.5, 1.0),
+                ))
+
+            rect = NSMakeRect(x, y, CELL, CELL)
+            if cell_date > today:
+                cell = _grass_cell(rect, NSColor.colorWithWhite_alpha_(0.93, 1.0), date_str)
+            else:
+                arrival = lab_arrivals.get(date_str, {})
+                arrival_status = arrival.get("status", "")
+                time_str = arrival.get("time", "")
+                if arrival_status == "arrived" and time_str:
+                    color = _arrival_color(time_str)
+                    cell = _grass_cell(rect, color, f"{date_str}  {time_str}着")
+                elif arrival_status == "not_going":
+                    cell = _grass_cell(rect, NSColor.colorWithWhite_alpha_(0.75, 1.0),
+                                       f"{date_str}  今日は行かない")
+                elif arrival_status == "pending":
+                    color = NSColor.colorWithRed_green_blue_alpha_(1.0, 0.78, 0.10, 0.8)
+                    cell = _grass_cell(rect, color, f"{date_str}  行く予定（未記録）")
+                else:
+                    cell = _grass_cell(rect, NSColor.colorWithWhite_alpha_(0.87, 1.0), date_str)
+            cv.addSubview_(cell)
+
+    for day, label in enumerate(["月", "", "水", "", "金", "", "日"]):
+        if not label:
+            continue
+        y = grid_base_y + (DAYS - 1 - day) * STEP
+        cv.addSubview_(_label(
+            label, NSMakeRect(2, y + 1, LEFT_MARGIN - 4, CELL),
+            NSFont.systemFontOfSize_(9),
+            color=NSColor.colorWithWhite_alpha_(0.5, 1.0),
+        ))
+
+    # Legend
+    lx = LEFT_MARGIN
+    cv.addSubview_(_label("早い", NSMakeRect(lx, 12, 28, 12), NSFont.systemFontOfSize_(10),
+                          color=NSColor.colorWithWhite_alpha_(0.5, 1.0)))
+    legend_times = ["09:00", "12:00", "15:00", "17:00", "20:00", "22:00"]
+    for i, t in enumerate(legend_times):
+        ix = lx + 32 + i * (CELL + 2)
+        leg = _grass_cell(NSMakeRect(ix, 12, CELL, CELL), _arrival_color(t))
+        cv.addSubview_(leg)
+    end_lx = lx + 32 + len(legend_times) * (CELL + 2) + 4
+    cv.addSubview_(_label("遅い", NSMakeRect(end_lx, 12, 28, 12), NSFont.systemFontOfSize_(10),
+                          color=NSColor.colorWithWhite_alpha_(0.5, 1.0)))
+
+    _btn(cv, "閉じる", _BTN1, NSMakeRect(W - 136, 8, 116, 30), primary=True)
+    _show(win)
+    try:
+        NSApp.runModalForWindow_(win)
+    finally:
+        win.orderOut_(None)
+        _hide()
+
+
 def notify(title: str, subtitle: str, body: str = ""):
     try:
         rumps.notification(title, subtitle, body)
@@ -1756,18 +2104,19 @@ class ProgressChecker(rumps.App):
         self.data = self._load()
         self._checkin_active = False
         self._break_mode = False
+        self._lab_reminder_timer = None
         self._pin_win = None
         self._pin_msg_label = None
         self._pin_delegate = None
 
         self._task_item = rumps.MenuItem("📌 タスク未設定", callback=None)
         self._message_item = rumps.MenuItem("💬 コメント: 未設定", callback=None)
-        self._next_item = rumps.MenuItem("⏭ 次: 未設定", callback=None)
+        self._next_item = rumps.MenuItem("🔀 並行: ―", callback=None)
         self._pin_item = rumps.MenuItem("📌 サムをピン留め", callback=self._cmd_toggle_pin)
         self.menu = [
             self._task_item,
-            self._message_item,
             self._next_item,
+            self._message_item,
             None,
             rumps.MenuItem("🔄 今すぐチェックイン",    callback=self._cmd_checkin),
             rumps.MenuItem("⏱ セッション時間を変更",  callback=self._cmd_edit_interval),
@@ -1781,6 +2130,8 @@ class ProgressChecker(rumps.App):
             rumps.MenuItem("🗓  今日の目標を変更",      callback=self._cmd_edit_today),
             None,
             rumps.MenuItem("📜 過去の記録を見る",         callback=self._cmd_show_history),
+            rumps.MenuItem("🏢 ラボ到着を記録",            callback=self._cmd_record_lab_arrival),
+            rumps.MenuItem("📊 ラボ出席履歴を見る",        callback=self._cmd_show_lab_history),
             None,
             rumps.MenuItem("📝 今日の振り返り（KPT）",    callback=self._cmd_do_retrospective),
             rumps.MenuItem("📊 過去の振り返りを見る",      callback=self._cmd_show_kpt_history),
@@ -1804,6 +2155,7 @@ class ProgressChecker(rumps.App):
         self._check_date_change()
         self._check_week_change()
 
+        self._update_lab_reminder_timer()
         if not self.data["goals"].get("short"):
             rumps.Timer(self._first_run, 1).start()
         else:
@@ -1826,6 +2178,7 @@ class ProgressChecker(rumps.App):
                 g["today"] = _normalize_today(g.get("today", []))
                 data.setdefault("next_task", "")
                 data.setdefault("next_next_task", "")
+                data.setdefault("parallel_task", "")
                 data.setdefault("current_message", "")
                 data.setdefault("sam_messages", [])
                 data.setdefault("sam_message", "")
@@ -1835,6 +2188,8 @@ class ProgressChecker(rumps.App):
                 data.setdefault("active_tries", [])
                 data.setdefault("today_date", datetime.now().strftime("%Y-%m-%d"))
                 data.setdefault("history", [])
+                data.setdefault("lab_arrivals", {})
+                data.setdefault("deferred_tasks", [])
                 data.setdefault("retro_reminded", {"date": "", "hours": []})
                 return data
             except Exception:
@@ -1848,6 +2203,7 @@ class ProgressChecker(rumps.App):
             "current_task": "",
             "next_task": "",
             "next_next_task": "",
+            "parallel_task": "",
             "current_message": "",
             "sam_messages": [],
             "sam_message": "",
@@ -1857,6 +2213,8 @@ class ProgressChecker(rumps.App):
             "interval_minutes": DEFAULT_INTERVAL,
             "today_date": datetime.now().strftime("%Y-%m-%d"),
             "history": [],
+            "lab_arrivals": {},
+            "deferred_tasks": [],
         }
 
     def _save(self):
@@ -1868,10 +2226,10 @@ class ProgressChecker(rumps.App):
     def _refresh_ui(self):
         task = self.data.get("current_task") or "タスク未設定"
         msg = self.data.get("current_message") or "未設定"
-        next_task = self.data.get("next_task") or "未設定"
-        self._task_item.title = f"📌 今: {_truncate10(task)}"
+        parallel = self.data.get("parallel_task") or ""
+        self._task_item.title = f"📌 今: {_truncate8(task)}"
+        self._next_item.title = f"🔀 並行: {_truncate8(parallel)}" if parallel else "🔀 並行: ―"
         self._message_item.title = f"💬 コメント: {_truncate10(msg)}"
-        self._next_item.title = f"⏭ 次: {_truncate10(next_task)}"
         self._update_countdown()
         sam_msg = self.data.get("sam_message") or "—"
         if self._pin_win is not None and self._pin_msg_label is not None:
@@ -2024,11 +2382,21 @@ class ProgressChecker(rumps.App):
             for text in weekly["days"].get(weekday_key, [])
             if text not in carryover_texts
         ]
+        new_today = scheduled + carryover
+        deferred = self.data.pop("deferred_tasks", [])
+        if deferred:
+            existing_texts = {t["text"] for t in new_today}
+            for t in deferred:
+                text = (t.get("text") or "") if isinstance(t, dict) else str(t)
+                if text and text not in existing_texts:
+                    new_today.append({"text": text, "done": False})
+                    existing_texts.add(text)
         self.data["today_date"] = today_str
-        self.data["goals"]["today"] = scheduled + carryover
+        self.data["goals"]["today"] = new_today
         # Reset daily retro reminder tracking for the new day
         self.data["retro_reminded"] = {"date": today_str, "hours": []}
         self._save()
+        self._update_lab_reminder_timer()
         self._check_week_change()
         if not self._checkin_active:
             rumps.Timer(self._prompt_new_day, 2).start()
@@ -2200,7 +2568,9 @@ class ProgressChecker(rumps.App):
             current = _normalize_today(self.data["goals"].get("today", []))
             val = show_today_task_editor("今日の目標を変更", current)
             if val is not None:
-                self.data["goals"]["today"] = val
+                kept, deferred = val
+                self.data["goals"]["today"] = kept
+                self._merge_deferred(deferred)
                 self._save()
         finally:
             self._checkin_active = False
@@ -2217,7 +2587,7 @@ class ProgressChecker(rumps.App):
     def _do_checkin_inner(self):
         current = self.data.get("current_task", "")
         if current and not self._break_mode:
-            result = show_feedback(current)
+            result, parallel_done = show_feedback(current, self.data.get("parallel_task", ""))
             if result == "complete":
                 notify("🎉 完了！", current, "素晴らしい！この調子で続けよう！")
                 today_items = _normalize_today(self.data["goals"].get("today", []))
@@ -2238,6 +2608,18 @@ class ProgressChecker(rumps.App):
             elif result == "replan":
                 notify("🔄 賢い判断！", "難しすぎたのかも", "もっと小さなタスクに分けてみよう 💡")
 
+            if parallel_done:
+                parallel = self.data.get("parallel_task", "")
+                if parallel:
+                    today_items = _normalize_today(self.data["goals"].get("today", []))
+                    pidx = next((i for i, t in enumerate(today_items) if t["text"] == parallel), None)
+                    if pidx is not None:
+                        today_items[pidx]["done"] = True
+                        self.data["goals"]["today"] = today_items
+                    self.data["parallel_task"] = ""
+                    self._save()
+                    notify("✅ 並行タスクも完了！", parallel[:30], "")
+
         nudge_timer = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
             CHECKIN_NUDGE_INTERVAL, _checkin_nudger, "nudge:", None, True)
         NSRunLoop.mainRunLoop().addTimer_forMode_(nudge_timer, NSRunLoopCommonModes)
@@ -2246,12 +2628,11 @@ class ProgressChecker(rumps.App):
             while True:
                 _wr_history = self.data.get("weekly_review_history", [])
                 _weekly_tries = _wr_history[-1]["kpt"].get("try", []) if _wr_history else []
-                action, new_task, queued_next_task, message, session_mins, updated_today = show_checkin(
+                action, new_task, parallel_task, message, session_mins, updated_today = show_checkin(
                     self.data["goals"],
                     today_date=self.data.get("today_date", ""),
                     current_task=self.data.get("current_task", ""),
                     queued_task=self.data.get("next_task", ""),
-                    queued_next_task=self.data.get("next_next_task", ""),
                     current_message=self.data.get("current_message", ""),
                     current_interval=self.data.get("interval_minutes", DEFAULT_INTERVAL),
                     active_tries=self.data.get("active_tries", []),
@@ -2268,7 +2649,9 @@ class ProgressChecker(rumps.App):
                 current = _normalize_today(self.data["goals"].get("today", []))
                 val = show_today_task_editor("今日の細分タスクを編集", current)
                 if val is not None:
-                    self.data["goals"]["today"] = val
+                    kept, deferred = val
+                    self.data["goals"]["today"] = kept
+                    self._merge_deferred(deferred)
                     self._save()
         finally:
             nudge_timer.invalidate()
@@ -2282,8 +2665,8 @@ class ProgressChecker(rumps.App):
 
         self._break_mode = False
         self.data["current_task"] = new_task
-        self.data["next_task"] = queued_next_task or ""
-        self.data["next_next_task"] = ""
+        self.data["next_task"] = ""
+        self.data["parallel_task"] = parallel_task or ""
         self.data["current_message"] = message or ""
         sam_msgs = self.data.get("sam_messages", [])
         if sam_msgs:
@@ -2564,6 +2947,78 @@ class ProgressChecker(rumps.App):
         self._checkin_active = True
         try:
             show_weekly_review_history(self.data.get("weekly_review_history", []))
+        finally:
+            self._checkin_active = False
+
+    # ── Deferred tasks ────────────────────────────────────────────────────
+
+    def _merge_deferred(self, deferred: list):
+        """Append deferred tasks to the queue (skipping duplicates)."""
+        if not deferred:
+            return
+        existing = self.data.setdefault("deferred_tasks", [])
+        existing_texts = {t["text"] for t in existing}
+        for t in deferred:
+            if t["text"] and t["text"] not in existing_texts:
+                existing.append(t)
+                existing_texts.add(t["text"])
+
+    # ── Lab arrival tracking ──────────────────────────────────────────────
+
+    def _update_lab_reminder_timer(self):
+        """Start 30-min reminder timer if today's lab status is 'pending'; stop otherwise."""
+        today_str = self.data.get("today_date", datetime.now().strftime("%Y-%m-%d"))
+        lab_arrivals = self.data.get("lab_arrivals", {})
+        status = lab_arrivals.get(today_str, {}).get("status", "")
+        if status == "pending":
+            if self._lab_reminder_timer is None:
+                self._lab_reminder_timer = rumps.Timer(self._on_lab_reminder_fire, 30 * 60)
+                self._lab_reminder_timer.start()
+        else:
+            if self._lab_reminder_timer is not None:
+                self._lab_reminder_timer.stop()
+                self._lab_reminder_timer = None
+
+    def _on_lab_reminder_fire(self, timer):
+        today_str = self.data.get("today_date", datetime.now().strftime("%Y-%m-%d"))
+        status = self.data.get("lab_arrivals", {}).get(today_str, {}).get("status", "")
+        if status != "pending":
+            timer.stop()
+            self._lab_reminder_timer = None
+            return
+        if not self._checkin_active:
+            _show_lab_reminder_popup(self)
+
+    def _cmd_record_lab_arrival(self, _):
+        if self._checkin_active:
+            return
+        self._checkin_active = True
+        try:
+            today_str = self.data.get("today_date", datetime.now().strftime("%Y-%m-%d"))
+            lab_arrivals = self.data.setdefault("lab_arrivals", {})
+            current = lab_arrivals.get(today_str, {})
+            result = show_lab_arrival_dialog(today_str, current)
+            if result is not None:
+                lab_arrivals[today_str] = result
+                self._save()
+                self._update_lab_reminder_timer()
+                status = result.get("status", "")
+                time_str = result.get("time", "")
+                if status == "arrived":
+                    notify("🏢 ラボ到着を記録しました", f"到着時刻: {time_str}", "")
+                elif status == "pending":
+                    notify("🏢 行く予定として記録しました", "30分ごとにリマインドします", "")
+                elif status == "not_going":
+                    notify("🏢 今日はラボなしで記録しました", "", "")
+        finally:
+            self._checkin_active = False
+
+    def _cmd_show_lab_history(self, _):
+        if self._checkin_active:
+            return
+        self._checkin_active = True
+        try:
+            show_lab_history_view(self.data.get("lab_arrivals", {}))
         finally:
             self._checkin_active = False
 
