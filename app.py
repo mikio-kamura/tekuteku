@@ -1388,14 +1388,20 @@ def show_history(history: list) -> None:
         _hide()
 
 
-def show_kpt_editor(keep: list, problem: list, try_: list, kpt_history: list = None) -> Optional[dict]:
+def show_kpt_editor(
+    keep: list, problem: list, try_: list,
+    kpt_history: list = None,
+    date_label: str = "",
+    can_go_next: bool = False,
+) -> Optional[tuple]:
     """KPT retrospective editor.
-    Returns {"keep": [...], "problem": [...], "try": [...]} or None."""
+    Returns (result_dict, action) where action is 'save'|'prev'|'next', or None if cancelled."""
     W, H = 580, 520
-    win = _make_win("今日の振り返り（KPT）", W, H)
+    win = _make_win("振り返り（KPT）", W, H)
     cv = win.contentView()
 
-    cv.addSubview_(_label("今日の振り返り（KPT）", NSMakeRect(20, H - 34, W - 40, 22), NSFont.boldSystemFontOfSize_(13)))
+    title_text = f"{date_label} の振り返り（KPT）" if date_label else "今日の振り返り（KPT）"
+    cv.addSubview_(_label(title_text, NSMakeRect(20, H - 34, W - 40, 22), NSFont.boldSystemFontOfSize_(13)))
     cv.addSubview_(_label(
         "1行に1つ入力してください",
         NSMakeRect(20, H - 54, W - 40, 16),
@@ -1421,10 +1427,13 @@ def show_kpt_editor(keep: list, problem: list, try_: list, kpt_history: list = N
         cv.addSubview_(scroll)
         text_views.append(tv)
 
-    _btn(cv, "決定", _BTN1, NSMakeRect(W - 136, 12, 116, 32), primary=True)
+    _btn(cv, "決定",    _BTN1, NSMakeRect(W - 136, 12, 116, 32), primary=True)
+    _btn(cv, "◀ 前日", _BTN2, NSMakeRect(160,       12, 110, 32))
+    if can_go_next:
+        _btn(cv, "翌日 ▶", _BTN3, NSMakeRect(W - 260, 12, 110, 32))
     if kpt_history is not None:
         _kpt_hist_btn_handler.history = list(kpt_history)
-        hist_btn = NSButton.alloc().initWithFrame_(NSMakeRect(20, 12, 140, 32))
+        hist_btn = NSButton.alloc().initWithFrame_(NSMakeRect(20, 12, 130, 32))
         hist_btn.setTitle_("📊 過去を見る")
         hist_btn.setBezelStyle_(1)
         hist_btn.setTarget_(_kpt_hist_btn_handler)
@@ -1440,7 +1449,12 @@ def show_kpt_editor(keep: list, problem: list, try_: list, kpt_history: list = N
             return None
         def _parse(tv):
             return [l.strip() for l in str(tv.string()).split("\n") if l.strip()]
-        return {"keep": _parse(text_views[0]), "problem": _parse(text_views[1]), "try": _parse(text_views[2])}
+        result = {"keep": _parse(text_views[0]), "problem": _parse(text_views[1]), "try": _parse(text_views[2])}
+        if resp == _BTN2:
+            return result, "prev"
+        if resp == _BTN3:
+            return result, "next"
+        return result, "save"
     finally:
         win.orderOut_(None)
         _hide()
@@ -2894,37 +2908,71 @@ class ProgressChecker(rumps.App):
         _show_retro_nudge_popup(self, yesterday_str, is_yesterday=True)
 
     def _do_retrospective_for(self, date_str: str):
-        """Run the KPT editor and save the result for the given date."""
+        """Run the KPT editor starting at date_str, with prev/next day navigation."""
         if self._checkin_active:
             return
         self._checkin_active = True
         try:
-            # Pre-fill only if an entry for this date already exists; otherwise start empty
-            kpt_history = self.data.get("kpt_history", [])
-            existing = next((e for e in kpt_history if e.get("date") == date_str), {})
-            result = show_kpt_editor(
-                existing.get("keep", []),
-                existing.get("problem", []),
-                existing.get("try", []),
-                kpt_history=kpt_history,
-            )
-            if result is None:
-                return
-            result["date"] = date_str
-            # Upsert into kpt_history
-            for i, entry in enumerate(kpt_history):
-                if entry.get("date") == date_str:
-                    kpt_history[i] = dict(result)
-                    break
-            else:
-                kpt_history.append(dict(result))
-            # Update current kpt only if this is today
             today_str = self.data.get("today_date", datetime.now().strftime("%Y-%m-%d"))
-            if date_str == today_str:
-                self.data["kpt"] = result
-                selected = show_try_selector(result.get("try", []))
-                self.data["active_tries"] = selected
-            self._save()
+            try:
+                today_dt = datetime.strptime(today_str, "%Y-%m-%d")
+            except ValueError:
+                today_dt = datetime.now()
+
+            current = date_str
+            while True:
+                try:
+                    current_dt = datetime.strptime(current, "%Y-%m-%d")
+                except ValueError:
+                    break
+
+                m, d = current_dt.month, current_dt.day
+                date_label = f"{m}/{d}"
+                can_go_next = current < today_str
+
+                kpt_history = self.data.get("kpt_history", [])
+                existing = next((e for e in kpt_history if e.get("date") == current), {})
+                ret = show_kpt_editor(
+                    existing.get("keep", []),
+                    existing.get("problem", []),
+                    existing.get("try", []),
+                    kpt_history=kpt_history,
+                    date_label=date_label,
+                    can_go_next=can_go_next,
+                )
+
+                if ret is None:
+                    break  # cancelled — don't save
+
+                result, action = ret
+                result["date"] = current
+
+                # Upsert into kpt_history
+                kpt_history = self.data.get("kpt_history", [])
+                for i, entry in enumerate(kpt_history):
+                    if entry.get("date") == current:
+                        kpt_history[i] = dict(result)
+                        break
+                else:
+                    kpt_history.append(dict(result))
+
+                if current == today_str:
+                    self.data["kpt"] = result
+                    if action == "save":
+                        selected = show_try_selector(result.get("try", []))
+                        self.data["active_tries"] = selected
+
+                self._save()
+
+                if action == "save":
+                    break
+                elif action == "prev":
+                    current = (current_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+                elif action == "next":
+                    nxt = current_dt + timedelta(days=1)
+                    if nxt > today_dt:
+                        break
+                    current = nxt.strftime("%Y-%m-%d")
         finally:
             self._checkin_active = False
 
