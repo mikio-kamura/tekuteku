@@ -2016,8 +2016,8 @@ def show_lab_history_view(lab_arrivals: dict) -> None:
     ))
 
     today = datetime.now().date()
-    current_monday = today - timedelta(days=today.weekday())
-    grid_start = current_monday - timedelta(weeks=WEEKS - 1)
+    current_sunday = today - timedelta(days=(today.weekday() + 1) % 7)
+    grid_start = current_sunday - timedelta(weeks=WEEKS - 1)
 
     shown_months: set = set()
 
@@ -2069,7 +2069,7 @@ def show_lab_history_view(lab_arrivals: dict) -> None:
                     cell = _grass_cell(rect, NSColor.colorWithWhite_alpha_(0.87, 1.0), date_str)
             cv.addSubview_(cell)
 
-    for day, label in enumerate(["月", "", "水", "", "金", "", "日"]):
+    for day, label in enumerate(["日", "", "火", "", "木", "", "土"]):
         if not label:
             continue
         y = grid_base_y + (DAYS - 1 - day) * STEP
