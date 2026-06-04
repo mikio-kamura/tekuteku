@@ -1393,18 +1393,45 @@ def show_kpt_editor(
     kpt_history: list = None,
     date_label: str = "",
     can_go_next: bool = False,
+    goals: dict = None,
 ) -> Optional[tuple]:
     """KPT retrospective editor.
     Returns (result_dict, action) where action is 'save'|'prev'|'next', or None if cancelled."""
-    W, H = 580, 520
+    W, H = 580, 620
     win = _make_win("振り返り（KPT）", W, H)
     cv = win.contentView()
 
+    # ── 目標表示（上部）────────────────────────────────────────────────────────
+    if goals:
+        _gy = H - 8
+        for _icon, _gname, _gkey in [
+            ("🌟", "長期目標", "long"),
+            ("📅", "中期目標", "mid"),
+            ("📌", "短期目標", "short"),
+        ]:
+            _gy -= 12
+            cv.addSubview_(_label(
+                f"{_icon}  {_gname}",
+                NSMakeRect(20, _gy, W - 40, 12),
+                NSFont.boldSystemFontOfSize_(10),
+                color=NSColor.colorWithWhite_alpha_(0.35, 1.0),
+            ))
+            _gy -= 3 + 14
+            cv.addSubview_(_mlabel(
+                goals.get(_gkey) or "未設定",
+                NSMakeRect(28, _gy, W - 48, 14),
+                NSFont.systemFontOfSize_(11),
+                color=NSColor.colorWithWhite_alpha_(0.5, 1.0),
+            ))
+            _gy -= 3
+        cv.addSubview_(_sep(NSMakeRect(20, _gy - 6, W - 40, 1)))
+
+    # Existing positions hardcoded from original H=520 layout
     title_text = f"{date_label} の振り返り（KPT）" if date_label else "今日の振り返り（KPT）"
-    cv.addSubview_(_label(title_text, NSMakeRect(20, H - 34, W - 40, 22), NSFont.boldSystemFontOfSize_(13)))
+    cv.addSubview_(_label(title_text, NSMakeRect(20, 486, W - 40, 22), NSFont.boldSystemFontOfSize_(13)))
     cv.addSubview_(_label(
         "1行に1つ入力してください",
-        NSMakeRect(20, H - 54, W - 40, 16),
+        NSMakeRect(20, 466, W - 40, 16),
         NSFont.systemFontOfSize_(11), color=NSColor.colorWithWhite_alpha_(0.5, 1.0),
     ))
 
@@ -1417,12 +1444,12 @@ def show_kpt_editor(
     text_views = []
     for idx, (title, subtitle, items) in enumerate(headers):
         x = 20 + idx * (col_w + 10)
-        cv.addSubview_(_label(title, NSMakeRect(x, H - 76, col_w, 18), NSFont.boldSystemFontOfSize_(12)))
+        cv.addSubview_(_label(title, NSMakeRect(x, 444, col_w, 18), NSFont.boldSystemFontOfSize_(12)))
         cv.addSubview_(_label(
-            subtitle, NSMakeRect(x, H - 96, col_w, 16),
+            subtitle, NSMakeRect(x, 424, col_w, 16),
             NSFont.systemFontOfSize_(11), color=NSColor.colorWithWhite_alpha_(0.5, 1.0),
         ))
-        scroll, tv = _text_view(items, NSMakeRect(x, 52, col_w, H - 152))
+        scroll, tv = _text_view(items, NSMakeRect(x, 52, col_w, 368))
         tv.setFont_(NSFont.systemFontOfSize_(13))
         cv.addSubview_(scroll)
         text_views.append(tv)
@@ -1659,12 +1686,38 @@ def show_weekly_review(
     prev_keep: list,
     prev_problem: list,
     prev_try: list,
+    goals: dict = None,
 ) -> Optional[dict]:
     """Weekly retrospective: shows last week's tasks + KPT + summary comment.
     Returns {"keep": [...], "problem": [...], "try": [...], "summary": str} or None (skipped)."""
-    W, H = 600, 680
+    W, H = 600, 780
     win = _make_win("先週の振り返り", W, H)
     cv = win.contentView()
+
+    # ── 目標表示（上部）────────────────────────────────────────────────────────
+    if goals:
+        _gy = H - 8
+        for _icon, _gname, _gkey in [
+            ("🌟", "長期目標", "long"),
+            ("📅", "中期目標", "mid"),
+            ("📌", "短期目標", "short"),
+        ]:
+            _gy -= 12
+            cv.addSubview_(_label(
+                f"{_icon}  {_gname}",
+                NSMakeRect(20, _gy, W - 40, 12),
+                NSFont.boldSystemFontOfSize_(10),
+                color=NSColor.colorWithWhite_alpha_(0.35, 1.0),
+            ))
+            _gy -= 3 + 14
+            cv.addSubview_(_mlabel(
+                goals.get(_gkey) or "未設定",
+                NSMakeRect(28, _gy, W - 48, 14),
+                NSFont.systemFontOfSize_(11),
+                color=NSColor.colorWithWhite_alpha_(0.5, 1.0),
+            ))
+            _gy -= 3
+        cv.addSubview_(_sep(NSMakeRect(20, _gy - 6, W - 40, 1)))
 
     try:
         mon_dt = datetime.strptime(week_start_str, "%Y-%m-%d")
@@ -2458,7 +2511,7 @@ class ProgressChecker(rumps.App):
             )
 
             notify("📅 新しい週が始まりました！", "まず先週を振り返りましょう")
-            result = show_weekly_review(last_week_start, last_week_entries, [], [], [])
+            result = show_weekly_review(last_week_start, last_week_entries, [], [], [], goals=self.data.get("goals", {}))
             if result is not None:
                 review_entry = {
                     "week_start": last_week_start,
@@ -2939,6 +2992,7 @@ class ProgressChecker(rumps.App):
                     kpt_history=kpt_history,
                     date_label=date_label,
                     can_go_next=can_go_next,
+                    goals=self.data.get("goals", {}),
                 )
 
                 if ret is None:
