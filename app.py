@@ -68,6 +68,8 @@ _WC_CYCLE   = 1 << 5
 # Modal return codes
 _BTN1, _BTN2, _BTN3 = 1000, 1001, 1002
 _BTN4 = 1003
+# Checkin dialog: per-section goal edit buttons
+_BTN_EDIT_WEEKLY, _BTN_EDIT_SHORT, _BTN_EDIT_MID, _BTN_EDIT_LONG = 1004, 1005, 1006, 1007
 _CANCEL = -1
 
 _BG = NSColor.colorWithRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.93)
@@ -1032,7 +1034,7 @@ def show_checkin(
     weekly_tries: Optional[list] = None,
 ) -> tuple[str, Optional[str], Optional[str], Optional[str], Optional[int], list]:
     """Returns (action, next_task, parallel_task, message, session_minutes, updated_today_items).
-    action is one of: start, break, edit_today."""
+    action is one of: start, break, edit_today, edit_weekly, edit_short, edit_mid, edit_long."""
     active_tries = active_tries or []
     weekly_tries = weekly_tries or []
     today_items = _normalize_today(goals.get("today", []))
@@ -1184,6 +1186,7 @@ def show_checkin(
         NSMakeRect(X + 20, 410, W - X - 40, 16),
         NSFont.boldSystemFontOfSize_(13),
     ))
+    _btn(cv, "変更", _BTN_EDIT_WEEKLY, NSMakeRect(W - 84, 404, 64, 24))
     cv.addSubview_(_mlabel(
         _weekly_goal,
         NSMakeRect(X + 28, 394, W - X - 48, 14),
@@ -1208,16 +1211,19 @@ def show_checkin(
     # ── 短期目標 ────────────────────────────────────────────────────────────
     cv.addSubview_(_label("📌  短期目標", NSMakeRect(X + 20, 294, W - X - 40, 16), NSFont.boldSystemFontOfSize_(13)))
     cv.addSubview_(_mlabel(goals.get("short") or "未設定", NSMakeRect(X + 28, 270, W - X - 48, 22), NSFont.systemFontOfSize_(13)))
+    _btn(cv, "変更", _BTN_EDIT_SHORT, NSMakeRect(W - 84, 288, 64, 24))
     cv.addSubview_(_sep(NSMakeRect(X + 20, 262, W - X - 40, 1)))
 
     # ── 中期目標 ────────────────────────────────────────────────────────────
     cv.addSubview_(_label("📅  中期目標", NSMakeRect(X + 20, 242, W - X - 40, 16), NSFont.boldSystemFontOfSize_(13)))
     cv.addSubview_(_mlabel(goals.get("mid") or "未設定", NSMakeRect(X + 28, 218, W - X - 48, 22), NSFont.systemFontOfSize_(13)))
+    _btn(cv, "変更", _BTN_EDIT_MID, NSMakeRect(W - 84, 236, 64, 24))
     cv.addSubview_(_sep(NSMakeRect(X + 20, 210, W - X - 40, 1)))
 
     # ── 長期目標 ────────────────────────────────────────────────────────────
     cv.addSubview_(_label("🌟  長期目標", NSMakeRect(X + 20, 190, W - X - 40, 16), NSFont.boldSystemFontOfSize_(13)))
     cv.addSubview_(_mlabel(goals.get("long") or "未設定", NSMakeRect(X + 28, 166, W - X - 48, 22), NSFont.systemFontOfSize_(13)))
+    _btn(cv, "変更", _BTN_EDIT_LONG, NSMakeRect(W - 84, 184, 64, 24))
     cv.addSubview_(_sep(NSMakeRect(X + 20, 158, W - X - 40, 1)))
 
     # ── 次回/次々回の選択 + セッション時間 + メッセージ ──────────────────────
@@ -1274,6 +1280,14 @@ def show_checkin(
                 return "break", None, None, None, None, updated_today
             if resp == _BTN3:
                 return "edit_today", None, None, None, None, updated_today
+            _edit_actions = {
+                _BTN_EDIT_WEEKLY: "edit_weekly",
+                _BTN_EDIT_SHORT: "edit_short",
+                _BTN_EDIT_MID: "edit_mid",
+                _BTN_EDIT_LONG: "edit_long",
+            }
+            if resp in _edit_actions:
+                return _edit_actions[resp], None, None, None, None, updated_today
 
             if not updated_today:
                 err.setStringValue_("先に細分タスクを追加してください")
@@ -2228,6 +2242,11 @@ class ProgressChecker(rumps.App):
         else:
             rumps.Timer(self._autoshow_pin, 0.5).start()
             rumps.Timer(self._prompt_missed_retro, 3).start()
+            if not self.data.get("current_task"):
+                # No active session at launch: open a checkin right away
+                # (after the pin/retro-nudge windows have appeared).
+                self._startup_checkin_timer = rumps.Timer(self._on_startup_checkin, 4)
+                self._startup_checkin_timer.start()
 
     # ── Persistence ───────────────────────────────────────────────────────
 
@@ -2440,11 +2459,14 @@ class ProgressChecker(rumps.App):
         carryover = [{"text": t["text"], "done": False}
                      for t in old_tasks if not t.get("done")]
         carryover_texts = {t["text"] for t in carryover}
-        # Add today's weekday tasks from the weekly plan (skip duplicates)
+        # Add today's weekday tasks from the weekly plan (skip duplicates).
+        # If the week also changed, the plan is stale — a fresh one gets made
+        # in _prompt_new_week, so don't seed from last week's plan.
         today_dt = datetime.strptime(today_str, "%Y-%m-%d")
         weekday_key = WEEKDAY_NAMES[today_dt.weekday()]
         weekly = _normalize_weekly(self.data["goals"].get("weekly", {}))
-        scheduled = [
+        week_changed = weekly.get("week_start") != _monday_of(today_dt).strftime("%Y-%m-%d")
+        scheduled = [] if week_changed else [
             {"text": text, "done": False}
             for text in weekly["days"].get(weekday_key, [])
             if text not in carryover_texts
@@ -2462,7 +2484,18 @@ class ProgressChecker(rumps.App):
         self.data["goals"]["today"] = new_today
         # Reset daily retro reminder tracking for the new day
         self.data["retro_reminded"] = {"date": today_str, "hours": []}
+        # Clear yesterday's leftover session: new day starts idle until the
+        # first checkin picks a task.
+        self.data["current_task"] = ""
+        self.data["next_task"] = ""
+        self.data["next_next_task"] = ""
+        self.data["parallel_task"] = ""
+        self.data["current_message"] = ""
+        self._break_mode = False
+        self._timer.stop()
+        self._next_checkin_at = datetime.now() + timedelta(days=365)
         self._save()
+        self._refresh_ui()
         self._update_lab_reminder_timer()
         self._check_week_change()
         if not self._checkin_active:
@@ -2479,8 +2512,10 @@ class ProgressChecker(rumps.App):
         weekly = _normalize_weekly(self.data["goals"].get("weekly", {}))
         if weekly.get("week_start") == current_week_start:
             return
-        # Week changed: update week_start and prompt
+        # Week changed: reset the plan to a blank slate and prompt
         weekly["week_start"] = current_week_start
+        weekly["goal"] = ""
+        weekly["days"] = {k: [] for k in WEEKDAY_NAMES}
         self.data["goals"]["weekly"] = weekly
         self._save()
         if not self._checkin_active:
@@ -2492,6 +2527,7 @@ class ProgressChecker(rumps.App):
             return
 
         # Step 1: weekly retrospective of last week
+        self._begin_activity_session(self._week_goal_task_name())
         self._checkin_active = True
         try:
             today_str = self.data.get("today_date", datetime.now().strftime("%Y-%m-%d"))
@@ -2563,6 +2599,18 @@ class ProgressChecker(rumps.App):
     def _autoshow_pin(self, timer: rumps.Timer):
         timer.stop()
         self._show_pin_window()
+
+    def _on_startup_checkin(self, timer: rumps.Timer):
+        """Fire the first checkin after launch when no session is active.
+        Keeps ticking while another dialog (new-day editor etc.) is open,
+        then runs the checkin exactly once."""
+        if self.data.get("current_task") or self._break_mode:
+            timer.stop()
+            return
+        if self._checkin_active:
+            return  # another dialog is up — retry on the next tick
+        timer.stop()
+        self._do_checkin()
 
     def _first_run(self, timer: rumps.Timer):
         timer.stop()
@@ -2642,6 +2690,26 @@ class ProgressChecker(rumps.App):
         finally:
             self._checkin_active = False
 
+    def _begin_activity_session(self, task_name: str):
+        """Count a reflection/planning activity (KPT, weekly goals) as the
+        current task, running one countdown of the default session length."""
+        self._break_mode = False
+        self.data["current_task"] = task_name
+        self.data["current_message"] = ""
+        self._save()
+        self._reset_timer()
+        self._refresh_ui()
+
+    def _week_goal_task_name(self) -> str:
+        today_str = self.data.get("today_date", datetime.now().strftime("%Y-%m-%d"))
+        try:
+            d = datetime.strptime(today_str, "%Y-%m-%d")
+        except ValueError:
+            d = datetime.now()
+        mon = _monday_of(d)
+        sun = mon + timedelta(days=6)
+        return f"{mon.month}/{mon.day}〜{sun.month}/{sun.day}週の目標"
+
     def _do_checkin(self):
         if self._checkin_active:
             return
@@ -2711,15 +2779,35 @@ class ProgressChecker(rumps.App):
                 self.data["last_checkin"] = datetime.now().isoformat()
                 self._save()
 
-                if action != "edit_today":
+                if action == "edit_today":
+                    current = _normalize_today(self.data["goals"].get("today", []))
+                    val = show_today_task_editor("今日の細分タスクを編集", current)
+                    if val is not None:
+                        kept, deferred = val
+                        self.data["goals"]["today"] = kept
+                        self._merge_deferred(deferred)
+                        self._save()
+                elif action == "edit_weekly":
+                    weekly = _normalize_weekly(self.data["goals"].get("weekly", {}))
+                    result = show_weekly_editor(weekly["goal"], weekly["days"], weekly.get("week_start", ""))
+                    if result is not None:
+                        weekly["goal"] = result["goal"]
+                        weekly["days"] = result["days"]
+                        self.data["goals"]["weekly"] = weekly
+                        self._save()
+                elif action in ("edit_long", "edit_mid", "edit_short"):
+                    key = action.removeprefix("edit_")
+                    title, prompt = {
+                        "long":  ("長期目標を変更", "1〜2年後に達成したいことは？"),
+                        "mid":   ("中期目標を変更", "1〜5ヶ月で達成したいことは？"),
+                        "short": ("短期目標を変更", "今日〜1ヶ月で達成したいことは？"),
+                    }[key]
+                    val = show_goal_input(title, prompt, default=self.data["goals"].get(key, ""))
+                    if val is not None:
+                        self.data["goals"][key] = val
+                        self._save()
+                else:
                     break
-                current = _normalize_today(self.data["goals"].get("today", []))
-                val = show_today_task_editor("今日の細分タスクを編集", current)
-                if val is not None:
-                    kept, deferred = val
-                    self.data["goals"]["today"] = kept
-                    self._merge_deferred(deferred)
-                    self._save()
         finally:
             nudge_timer.invalidate()
 
@@ -2891,6 +2979,7 @@ class ProgressChecker(rumps.App):
     def _edit_weekly(self):
         if self._checkin_active:
             return
+        self._begin_activity_session(self._week_goal_task_name())
         self._checkin_active = True
         try:
             weekly = _normalize_weekly(self.data["goals"].get("weekly", {}))
@@ -2964,6 +3053,11 @@ class ProgressChecker(rumps.App):
         """Run the KPT editor starting at date_str, with prev/next day navigation."""
         if self._checkin_active:
             return
+        try:
+            _kpt_dt = datetime.strptime(date_str, "%Y-%m-%d")
+            self._begin_activity_session(f"{_kpt_dt.month}月{_kpt_dt.day}日のKPT")
+        except ValueError:
+            pass
         self._checkin_active = True
         try:
             today_str = self.data.get("today_date", datetime.now().strftime("%Y-%m-%d"))
