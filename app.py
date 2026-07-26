@@ -70,6 +70,8 @@ _BTN1, _BTN2, _BTN3 = 1000, 1001, 1002
 _BTN4 = 1003
 # Checkin dialog: per-section goal edit buttons
 _BTN_EDIT_WEEKLY, _BTN_EDIT_SHORT, _BTN_EDIT_MID, _BTN_EDIT_LONG = 1004, 1005, 1006, 1007
+# KPT / weekly-review dialogs: start a task session without closing the dialog
+_BTN_START_SESSION = 1008
 _CANCEL = -1
 
 _BG = NSColor.colorWithRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.93)
@@ -1408,9 +1410,12 @@ def show_kpt_editor(
     date_label: str = "",
     can_go_next: bool = False,
     goals: dict = None,
+    on_start_session=None,
 ) -> Optional[tuple]:
     """KPT retrospective editor.
-    Returns (result_dict, action) where action is 'save'|'prev'|'next', or None if cancelled."""
+    Returns (result_dict, action) where action is 'save'|'prev'|'next', or None if cancelled.
+    on_start_session: if given, shows a button that runs it (a checkin flow)
+    while this window stays open with its typed content intact."""
     W, H = 580, 620
     win = _make_win("振り返り（KPT）", W, H)
     cv = win.contentView()
@@ -1443,6 +1448,8 @@ def show_kpt_editor(
     # Existing positions hardcoded from original H=520 layout
     title_text = f"{date_label} の振り返り（KPT）" if date_label else "今日の振り返り（KPT）"
     cv.addSubview_(_label(title_text, NSMakeRect(20, 486, W - 40, 22), NSFont.boldSystemFontOfSize_(13)))
+    if on_start_session is not None:
+        _btn(cv, "▶ セッションを開始", _BTN_START_SESSION, NSMakeRect(W - 190, 482, 170, 26))
     cv.addSubview_(_label(
         "1行に1つ入力してください",
         NSMakeRect(20, 466, W - 40, 16),
@@ -1485,7 +1492,14 @@ def show_kpt_editor(
     win.setInitialFirstResponder_(text_views[0])
     _show(win)
     try:
-        resp = NSApp.runModalForWindow_(win)
+        while True:
+            resp = NSApp.runModalForWindow_(win)
+            if resp == _BTN_START_SESSION:
+                if on_start_session is not None:
+                    on_start_session()
+                _show(win)  # bring this window back to front and continue
+                continue
+            break
         if resp == _CANCEL:
             return None
         def _parse(tv):
@@ -1701,9 +1715,12 @@ def show_weekly_review(
     prev_problem: list,
     prev_try: list,
     goals: dict = None,
+    on_start_session=None,
 ) -> Optional[dict]:
     """Weekly retrospective: shows last week's tasks + KPT + summary comment.
-    Returns {"keep": [...], "problem": [...], "try": [...], "summary": str} or None (skipped)."""
+    Returns {"keep": [...], "problem": [...], "try": [...], "summary": str} or None (skipped).
+    on_start_session: if given, shows a button that runs it (a checkin flow)
+    while this window stays open with its typed content intact."""
     W, H = 600, 780
     win = _make_win("先週の振り返り", W, H)
     cv = win.contentView()
@@ -1811,6 +1828,8 @@ def show_weekly_review(
 
     _btn(cv, "スキップ", _BTN2, NSMakeRect(W-264, 12, 116, 32))
     _btn(cv, "決定", _BTN1, NSMakeRect(W-136, 12, 116, 32), primary=True)
+    if on_start_session is not None:
+        _btn(cv, "▶ セッションを開始", _BTN_START_SESSION, NSMakeRect(20, 12, 170, 32))
     text_views[0].setNextKeyView_(text_views[1])
     text_views[1].setNextKeyView_(text_views[2])
     text_views[2].setNextKeyView_(summary_field)
@@ -1818,7 +1837,14 @@ def show_weekly_review(
     win.setInitialFirstResponder_(text_views[0])
     _show(win)
     try:
-        resp = NSApp.runModalForWindow_(win)
+        while True:
+            resp = NSApp.runModalForWindow_(win)
+            if resp == _BTN_START_SESSION:
+                if on_start_session is not None:
+                    on_start_session()
+                _show(win)  # bring this window back to front and continue
+                continue
+            break
         if resp in (_CANCEL, _BTN2):
             return None
         def _parse_tv(t):
@@ -2547,7 +2573,9 @@ class ProgressChecker(rumps.App):
             )
 
             notify("📅 新しい週が始まりました！", "まず先週を振り返りましょう")
-            result = show_weekly_review(last_week_start, last_week_entries, [], [], [], goals=self.data.get("goals", {}))
+            result = show_weekly_review(last_week_start, last_week_entries, [], [], [],
+                                        goals=self.data.get("goals", {}),
+                                        on_start_session=self._checkin_dialog_flow)
             if result is not None:
                 review_entry = {
                     "week_start": last_week_start,
@@ -2720,6 +2748,10 @@ class ProgressChecker(rumps.App):
             self._checkin_active = False
 
     def _do_checkin_inner(self):
+        self._checkin_feedback()
+        self._checkin_dialog_flow()
+
+    def _checkin_feedback(self):
         current = self.data.get("current_task", "")
         if current and not self._break_mode:
             result, parallel_done = show_feedback(current, self.data.get("parallel_task", ""))
@@ -2755,6 +2787,10 @@ class ProgressChecker(rumps.App):
                     self._save()
                     notify("✅ 並行タスクも完了！", parallel[:30], "")
 
+    def _checkin_dialog_flow(self):
+        """Checkin dialog loop + session start. Assumes _checkin_active is set.
+        Also called from inside the KPT / weekly-review dialogs (▶ セッションを開始),
+        where the surrounding dialog stays open behind the checkin."""
         nudge_timer = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
             CHECKIN_NUDGE_INTERVAL, _checkin_nudger, "nudge:", None, True)
         NSRunLoop.mainRunLoop().addTimer_forMode_(nudge_timer, NSRunLoopCommonModes)
@@ -3087,6 +3123,7 @@ class ProgressChecker(rumps.App):
                     date_label=date_label,
                     can_go_next=can_go_next,
                     goals=self.data.get("goals", {}),
+                    on_start_session=self._checkin_dialog_flow,
                 )
 
                 if ret is None:
