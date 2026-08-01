@@ -32,6 +32,7 @@ from AppKit import (
     NSMakeRect,
     NSMenu,
     NSMenuItem,
+    NSPanel,
     NSEventModifierFlagCommand,
     NSEventModifierFlagShift,
     NSPasteboardTypeString,
@@ -173,9 +174,12 @@ def _show_nudge_popup():
         return
 
     W, H = 280, 400
-    win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+    # NSPanel + worksWhenModal: modal run loop (runModalForWindow) discards clicks
+    # to ordinary windows, so a plain NSWindow's buttons go dead while a dialog is open.
+    win = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
         NSMakeRect(0, 0, W, H), 1 | 2, 2, False,
     )
+    win.setWorksWhenModal_(True)
     win.setTitle_("⏰ まだチェックインしてないのか？")
     win.setOpaque_(False)
     win.setBackgroundColor_(_BG)
@@ -265,8 +269,19 @@ class _RetroNudgeHandler(NSObject):
     def doRetro_(self, sender):
         self.dismiss_(None)
         app = self.app_ref
-        if app is not None:
-            rumps.Timer(lambda t: (t.stop(), app._do_retrospective_for(self.date_ref[0])), 0.1).start()
+        if app is None:
+            return
+        date_str = self.date_ref[0]
+
+        def _fire(t):
+            # _do_retrospective_for is a no-op while another dialog is open
+            # (_checkin_active), so keep polling until it can actually run.
+            if app._checkin_active:
+                return
+            t.stop()
+            app._do_retrospective_for(date_str)
+
+        rumps.Timer(_fire, 0.2).start()
 
     def windowShouldClose_(self, win):
         self.dismiss_(None)
@@ -284,9 +299,12 @@ def _show_retro_nudge_popup(app_ref, date_str: str, is_yesterday: bool = False):
     _retro_nudge_handler.date_ref[0] = date_str
 
     W, H = 300, 160
-    win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+    # NSPanel + worksWhenModal: see _show_nudge_popup — buttons must stay clickable
+    # even while a modal dialog (check-in etc.) is open.
+    win = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
         NSMakeRect(0, 0, W, H), 1 | 2, 2, False,
     )
+    win.setWorksWhenModal_(True)
     if is_yesterday:
         win.setTitle_("📝 昨日の振り返りが未完了です")
         msg = "昨日の振り返り（KPT）が\nまだできていません。"
