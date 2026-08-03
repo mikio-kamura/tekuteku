@@ -35,6 +35,7 @@ from AppKit import (
     NSPanel,
     NSEventModifierFlagCommand,
     NSEventModifierFlagShift,
+    NSEventTrackingRunLoopMode,
     NSPasteboardTypeString,
     NSScreen,
     NSScrollView,
@@ -127,6 +128,7 @@ class _UiTicker(NSObject):
     def tick_(self, timer):
         if self.app_ref is not None:
             self.app_ref._update_countdown()
+            self.app_ref._check_session_expiry()
 
 
 _ui_ticker = _UiTicker.alloc().init()
@@ -2228,6 +2230,7 @@ class ProgressChecker(rumps.App):
         super().__init__("🎯", quit_button=None)
         self.data = self._load()
         self._checkin_active = False
+        self._checkin_flow_running = False
         self._break_mode = False
         self._lab_reminder_timer = None
         self._pin_win = None
@@ -2593,7 +2596,7 @@ class ProgressChecker(rumps.App):
             notify("📅 新しい週が始まりました！", "まず先週を振り返りましょう")
             result = show_weekly_review(last_week_start, last_week_entries, [], [], [],
                                         goals=self.data.get("goals", {}),
-                                        on_start_session=self._checkin_dialog_flow)
+                                        on_start_session=self._nested_checkin_flow)
             if result is not None:
                 review_entry = {
                     "week_start": last_week_start,
@@ -2766,8 +2769,44 @@ class ProgressChecker(rumps.App):
             self._checkin_active = False
 
     def _do_checkin_inner(self):
-        self._checkin_feedback()
-        self._checkin_dialog_flow()
+        self._checkin_flow_running = True
+        try:
+            self._checkin_feedback()
+            self._checkin_dialog_flow()
+        finally:
+            self._checkin_flow_running = False
+
+    def _nested_checkin_flow(self):
+        """on_start_session callback for the KPT / weekly-review dialogs.
+        Marks the checkin flow as running so _check_session_expiry won't
+        stack another checkin on top of it."""
+        self._checkin_flow_running = True
+        try:
+            self._checkin_dialog_flow()
+        finally:
+            self._checkin_flow_running = False
+
+    def _check_session_expiry(self):
+        """Runs on the 1s UI ticker (NSRunLoopCommonModes). The rumps session
+        timer and watchdog only tick in the default run-loop mode, so they
+        freeze while any modal dialog (weekly KPT etc.) is open — a session
+        could end without the feedback/checkin flow ever appearing. This fires
+        the flow nested on top of whatever dialog is active."""
+        if self._checkin_flow_running:
+            return
+        if not self._break_mode and not self.data.get("current_task"):
+            return
+        if datetime.now() < self._next_checkin_at:
+            return
+        # A menu is being tracked — opening a modal window now would misbehave.
+        if NSRunLoop.currentRunLoop().currentMode() == NSEventTrackingRunLoopMode:
+            return
+        was_active = self._checkin_active
+        self._checkin_active = True
+        try:
+            self._do_checkin_inner()
+        finally:
+            self._checkin_active = was_active
 
     def _checkin_feedback(self):
         current = self.data.get("current_task", "")
@@ -3141,7 +3180,7 @@ class ProgressChecker(rumps.App):
                     date_label=date_label,
                     can_go_next=can_go_next,
                     goals=self.data.get("goals", {}),
-                    on_start_session=self._checkin_dialog_flow,
+                    on_start_session=self._nested_checkin_flow,
                 )
 
                 if ret is None:
