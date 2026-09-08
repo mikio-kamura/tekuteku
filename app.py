@@ -74,6 +74,10 @@ _BTN4 = 1003
 _BTN_EDIT_WEEKLY, _BTN_EDIT_SHORT, _BTN_EDIT_MID, _BTN_EDIT_LONG = 1004, 1005, 1006, 1007
 # KPT / weekly-review dialogs: start a task session without closing the dialog
 _BTN_START_SESSION = 1008
+_BTN_CHILD, _BTN_OUTDENT, _BTN_INDENT = 1009, 1010, 1011  # 細分タスクのツリー操作
+_BTN_MOVE_UP, _BTN_MOVE_DOWN = 1012, 1013  # 部分木を兄弟の前後へ
+_tree_editor_open = [False]  # 細分タスク編集中は ⌘Enter を「子として追加」にする
+MAX_TASK_LEVEL = 2  # 0,1,2 の3層
 _CANCEL = -1
 
 _BG = NSColor.colorWithRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.93)
@@ -462,16 +466,149 @@ def _text_view(items: List[str], rect) -> tuple:
 
 
 def _normalize_today(items) -> list:
-    """Ensure today items are list of {"text": str, "done": bool}."""
+    """Ensure today items are list of {"text": str, "done": bool, "level": 0..2}.
+    ツリーはフラットな配列＋level（インデント）で表す。親の直後に level+1 の子が並ぶ。"""
     if isinstance(items, str):
         items = [items] if items.strip() else []
     result = []
     for item in items:
         if isinstance(item, str):
-            result.append({"text": item, "done": False})
+            result.append({"text": item, "done": False, "level": 0})
         elif isinstance(item, dict):
-            result.append({"text": item.get("text", ""), "done": bool(item.get("done", False))})
-    return result
+            try:
+                lv = int(item.get("level", 0) or 0)
+            except (TypeError, ValueError):
+                lv = 0
+            result.append({"text": item.get("text", ""), "done": bool(item.get("done", False)),
+                           "level": max(0, min(MAX_TASK_LEVEL, lv))})
+    return _normalize_levels(result)
+
+
+def _normalize_levels(items: list) -> list:
+    """親のいない子（前の行より2段以上深い）を詰めて、0..MAX の範囲に収める。in-place。"""
+    prev = -1
+    for item in items:
+        lv = int(item.get("level", 0) or 0)
+        lv = max(0, min(MAX_TASK_LEVEL, lv, prev + 1))
+        item["level"] = lv
+        prev = lv
+    return items
+
+
+def _subtree_indices(items: list, i: int) -> list[int]:
+    """i 番目とその子孫（後続で level が深い行）のインデックス。"""
+    if not (0 <= i < len(items)):
+        return []
+    base = int(items[i].get("level", 0) or 0)
+    out = [i]
+    for j in range(i + 1, len(items)):
+        if int(items[j].get("level", 0) or 0) <= base:
+            break
+        out.append(j)
+    return out
+
+
+def _subtree_end(items: list, i: int) -> int:
+    """i の部分木の次の行のインデックス（挿入位置に使う）。"""
+    idx = _subtree_indices(items, i)
+    return (idx[-1] + 1) if idx else len(items)
+
+
+def _move_subtree(items: list, i: int, delta: int) -> int:
+    """i の部分木を前(-1)/後(+1)の兄弟と入れ替える。戻り値は移動後のインデックス。動かせなければ i。"""
+    if not (0 <= i < len(items)):
+        return i
+    cur = int(items[i].get("level", 0) or 0)
+    sub = _subtree_indices(items, i)
+    block = [items[k] for k in sub]
+    if delta < 0:
+        j = i - 1
+        while j >= 0 and int(items[j].get("level", 0) or 0) > cur:
+            j -= 1
+        if j < 0 or int(items[j].get("level", 0) or 0) != cur:
+            return i
+        del items[sub[0]:sub[-1] + 1]
+        items[j:j] = block
+        return j
+    j = sub[-1] + 1
+    if j >= len(items) or int(items[j].get("level", 0) or 0) != cur:
+        return i
+    end = _subtree_end(items, j)
+    del items[sub[0]:sub[-1] + 1]
+    ins = end - len(block)
+    items[ins:ins] = block
+    return ins
+
+
+def _split_done(items: list) -> tuple[list, list]:
+    """完了済みを隠す。(visible, hidden) を返す。hidden の各要素は
+    {"item", "anchor"(直前の未完了行の dict そのもの or None), "after_hidden"(直前が隠し行か), "rel"(直前行からの相対 level)}。
+    直前行（隠し行も含む）からの相対で覚えるので、隠れた親子の形がそのまま戻る。"""
+    visible, hidden = [], []
+    prev_level, prev_hidden = 0, False
+    for it in items:
+        lv = int(it.get("level", 0) or 0)
+        if it.get("done"):
+            hidden.append({"item": it, "anchor": visible[-1] if visible else None,
+                           "after_hidden": prev_hidden, "rel": lv - prev_level})
+            prev_hidden = True
+        else:
+            visible.append(it)
+            prev_hidden = False
+        prev_level = lv
+    return visible, hidden
+
+
+def _restore_done(kept: list, hidden: list) -> list:
+    """編集後の kept（visible と同じ dict オブジェクトを含む）に、隠した完了済みを anchor の直後へ戻す。
+    anchor が消えていれば末尾に残す（完了記録を落とさない）。"""
+    out = list(kept)
+    last_pos = -1
+    for h in hidden:
+        it = dict(h["item"])
+        anchor = h["anchor"]
+        if h["after_hidden"] and last_pos >= 0:
+            pos, base = last_pos + 1, int(out[last_pos].get("level", 0) or 0)
+        elif anchor is None:
+            pos, base = 0, 0
+        else:
+            k = next((k for k, o in enumerate(out) if o is anchor), None)
+            if k is None:
+                pos, base = len(out), -h["rel"]
+            else:
+                pos, base = k + 1, int(anchor.get("level", 0) or 0)
+        it["level"] = max(0, min(MAX_TASK_LEVEL, base + h["rel"]))
+        out.insert(pos, it)
+        last_pos = pos
+    return _normalize_levels(out)
+
+
+def _task_prefix(level: int) -> str:
+    """表示用インデント。0: ""、1: "　└ "、2: "　　└ " """
+    level = max(0, min(MAX_TASK_LEVEL, int(level or 0)))
+    return ("　" * level + "└ ") if level else ""
+
+
+def _strip_task_prefix(text: str) -> str:
+    return (text or "").lstrip("　 └").strip()
+
+
+def _is_leaf(items: list, i: int) -> bool:
+    return len(_subtree_indices(items, i)) == 1
+
+
+def _first_undone_index(items: list, start: int = 0) -> Optional[int]:
+    """未完了の末端タスクを優先し、なければ未完了の行を返す（親は見出し役なので後回し）。"""
+    undone = [i for i in range(start, len(items)) if not items[i].get("done")]
+    for i in undone:
+        if _is_leaf(items, i):
+            return i
+    return undone[0] if undone else None
+
+
+def _task_display(item: dict, number: Optional[int] = None) -> str:
+    n = f"{number}. " if number is not None else ""
+    return f"{_task_prefix(item.get('level', 0))}{n}{item.get('text', '')}"
 
 
 def _truncate10(text: str) -> str:
@@ -571,18 +708,18 @@ class _TodayTaskTableModel(NSObject):
         if 0 <= row < len(self.items):
             if column.identifier() == "done":
                 return 1 if self.items[row].get("done") else 0
-            text = self.items[row]["text"]
-            if self.show_numbers:
-                return f"{row + 1}. {text}"
-            return text
+            return _task_display(self.items[row], (row + 1) if self.show_numbers else None)
         return ""
 
     def tableView_setObjectValue_forTableColumn_row_(self, _table, value, column, row):
         if 0 <= row < len(self.items):
             if column.identifier() == "done":
-                self.items[row]["done"] = bool(value)
+                # 親のチェックは子孫にも揃える（ロジックツリーとして一括で済ませる）
+                done = bool(value)
+                for i in _subtree_indices(self.items, row):
+                    self.items[i]["done"] = done
             else:
-                text = str(value or "").strip()
+                text = _strip_task_prefix(str(value or ""))
                 if self.show_numbers and text and text[0].isdigit():
                     dot_idx = text.find(". ")
                     if dot_idx > 0 and text[:dot_idx].isdigit():
@@ -611,17 +748,50 @@ class _TodayTaskTableModel(NSObject):
             src_set = {int(s) for s in raw.split(",")}
         except ValueError:
             return False
+        # 親を動かすときは子孫ごと動かす
+        for i in list(src_set):
+            src_set.update(_subtree_indices(self.items, i))
         moving = [self.items[i] for i in sorted(src_set) if 0 <= i < len(self.items)]
         if not moving:
             return False
         n_before = sum(1 for i in src_set if i < row)
         remaining = [item for i, item in enumerate(self.items) if i not in src_set]
         insert_at = max(0, min(row - n_before, len(remaining)))
+        # 落とした先の深さに合わせる：直前の行の子になれる深さまでに収める
+        top_level = min(int(m.get("level", 0) or 0) for m in moving)
+        prev_level = int(remaining[insert_at - 1].get("level", 0) or 0) if insert_at > 0 else -1
+        shift = min(0, (prev_level + 1) - top_level)
+        for item in moving:
+            item["level"] = max(0, int(item.get("level", 0) or 0) + shift)
         for item in reversed(moving):
             remaining.insert(insert_at, item)
         self.items[:] = remaining
+        _normalize_levels(self.items)
         _table.deselectAll_(None)
         return True
+
+
+class _TreeTableView(NSTableView):
+    """細分タスク編集用：Tab/Shift+Tab で階層、⌘↑↓ で兄弟間の移動、Delete で削除。
+    キーはモーダルの応答コードに変換して、ボタンと同じ経路で処理する。"""
+    def keyDown_(self, event):
+        code = event.keyCode()
+        flags = event.modifierFlags()
+        shift = bool(flags & NSEventModifierFlagShift)
+        cmd = bool(flags & NSEventModifierFlagCommand)
+        resp = None
+        if code == 48:                       # Tab
+            resp = _BTN_OUTDENT if shift else _BTN_INDENT
+        elif code in (51, 117) and self.selectedRow() >= 0:   # Delete / fn+Delete
+            resp = _BTN2
+        elif cmd and code == 126:            # ⌘↑
+            resp = _BTN_MOVE_UP
+        elif cmd and code == 125:            # ⌘↓
+            resp = _BTN_MOVE_DOWN
+        if resp is not None and NSApp.modalWindow() is self.window():
+            NSApp.stopModalWithCode_(resp)
+            return
+        objc.super(_TreeTableView, self).keyDown_(event)
 
 
 # ── Custom modal window ───────────────────────────────────────────────────────
@@ -673,6 +843,9 @@ class _KeyWindow(NSWindow):
         flags = event.modifierFlags()
         char = event.charactersIgnoringModifiers()
         if flags & NSEventModifierFlagCommand:
+            if _tree_editor_open[0] and char in ("\r", "\x03") and NSApp.modalWindow() is self:
+                NSApp.stopModalWithCode_(_BTN_CHILD)
+                return True
             if (flags & NSEventModifierFlagShift) and char == "z":
                 if NSApp.sendAction_to_from_("redo:", None, None):
                     return True
@@ -931,18 +1104,26 @@ def _parse_task_index(raw: str, tasks: list[dict]) -> Optional[str]:
 def show_today_task_editor(title: str, items: list[dict]) -> Optional[tuple]:
     """Task editor with add/delete/defer and drag & drop reorder.
     Returns (kept_items, deferred_items) or None if cancelled."""
-    W, H = 520, 360
+    W, H = 560, 440
     win = _make_win(title, W, H)
     cv = win.contentView()
-    cv.addSubview_(_label("今日行う細分タスク（ドラッグで並び替え）", NSMakeRect(20, 328, W-40, 20), NSFont.boldSystemFontOfSize_(13)))
+    cv.addSubview_(_label("今日行う細分タスク（3層のツリー）",
+                          NSMakeRect(20, H - 32, W-40, 20), NSFont.boldSystemFontOfSize_(13)))
+    cv.addSubview_(_label("Tab/⇧Tab: 階層　⌘↑↓: 移動　⌫: 削除　⌘⏎: 子として追加　ドラッグ・ダブルクリックも可",
+                          NSMakeRect(20, H - 50, W-40, 16), NSFont.systemFontOfSize_(11),
+                          color=NSColor.colorWithWhite_alpha_(0.45, 1.0)))
 
-    model = _TodayTaskTableModel.alloc().initWithItems_(_normalize_today(items))
-    scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(20, 96, W - 40, 224))
+    # 完了済みは編集画面では隠す。直前の未完了行（anchor）との相対位置を覚えて、決定時に戻す
+    visible, hidden = _split_done(_normalize_today(items))
+    model = _TodayTaskTableModel.alloc().initWithItems_(visible)
+    TABLE_H = 224
+    TABLE_Y = H - 58 - TABLE_H
+    scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(20, TABLE_Y, W - 40, TABLE_H))
     scroll.setHasVerticalScroller_(True)
     scroll.setAutohidesScrollers_(True)
     scroll.setBorderType_(2)
 
-    table = NSTableView.alloc().initWithFrame_(NSMakeRect(0, 0, W - 56, 224))
+    table = _TreeTableView.alloc().initWithFrame_(NSMakeRect(0, 0, W - 56, TABLE_H))
     col = NSTableColumn.alloc().initWithIdentifier_("task")
     col.setWidth_(W - 56)
     col.setEditable_(True)
@@ -958,14 +1139,25 @@ def show_today_task_editor(title: str, items: list[dict]) -> Optional[tuple]:
     scroll.setDocumentView_(table)
     cv.addSubview_(scroll)
 
-    input_field = _input_field(NSMakeRect(20, 58, W - 170, 30), NSFont.systemFontOfSize_(14), placeholder="細分タスクを入力して追加")
+    input_field = _input_field(NSMakeRect(20, TABLE_Y - 38, W - 236, 30), NSFont.systemFontOfSize_(14),
+                               placeholder="細分タスクを入力して追加（選択行の下に同じ階層で）")
     cv.addSubview_(input_field)
-    err = _label("", NSMakeRect(20, 40, W - 40, 16), NSFont.systemFontOfSize_(12), color=NSColor.systemOrangeColor())
+    _btn(cv, "追加",   _BTN3,       NSMakeRect(W - 206, TABLE_Y - 38, 60, 30))
+    _btn(cv, "子として追加", _BTN_CHILD, NSMakeRect(W - 140, TABLE_Y - 38, 120, 30))
+
+    # 2段目：階層の上げ下げ・削除
+    ROW2_Y = TABLE_Y - 74
+    _btn(cv, "◀ 上の階層へ", _BTN_OUTDENT, NSMakeRect(20, ROW2_Y, 110, 28))
+    _btn(cv, "▶ 下の階層へ", _BTN_INDENT,  NSMakeRect(136, ROW2_Y, 110, 28))
+    _btn(cv, "削除", _BTN2, NSMakeRect(W - 74, ROW2_Y, 54, 28))
+    err = _label("", NSMakeRect(20, ROW2_Y - 20, W - 40, 16), NSFont.systemFontOfSize_(12), color=NSColor.systemOrangeColor())
     cv.addSubview_(err)
 
-    _btn(cv, "追加", _BTN3, NSMakeRect(W - 140, 58, 60, 30))
-    _btn(cv, "削除", _BTN2, NSMakeRect(W - 74, 58, 54, 30))
     _btn(cv, "📅 翌日に移動", _BTN4, NSMakeRect(20, 10, 128, 28))
+    if hidden:
+        cv.addSubview_(_label(f"完了済み {len(hidden)} 件は非表示（チェックイン画面で戻せます）",
+                              NSMakeRect(156, 14, W - 156 - 130, 16), NSFont.systemFontOfSize_(11),
+                              color=NSColor.colorWithWhite_alpha_(0.45, 1.0)))
     _btn(cv, "決定", _BTN1, NSMakeRect(W - 136, 10, 116, 28), primary=False)
     # Enter in input field should add item, not submit dialog.
     input_field.setTag_(_BTN3)
@@ -973,70 +1165,133 @@ def show_today_task_editor(title: str, items: list[dict]) -> Optional[tuple]:
     input_field.setAction_("click:")
     win.setInitialFirstResponder_(input_field)
     deferred_items: list = []
+    _tree_editor_open[0] = True
     _show(win)
     try:
         while True:
             resp = NSApp.runModalForWindow_(win)
             if resp == _CANCEL:
                 return None
+            if resp in (_BTN_MOVE_UP, _BTN_MOVE_DOWN):
+                sel = table.selectedRow()
+                if sel < 0:
+                    err.setStringValue_("移動する行を選択してください")
+                    continue
+                new_i = _move_subtree(model.items, sel, -1 if resp == _BTN_MOVE_UP else 1)
+                table.reloadData()
+                table.selectRowIndexes_byExtendingSelection_(NSIndexSet.indexSetWithIndex_(new_i), False)
+                win.makeFirstResponder_(table)
+                continue
             if resp == _BTN3:
                 text = input_field.stringValue().strip()
                 if not text:
                     err.setStringValue_("追加するタスクを入力してください")
                     continue
                 sel = table.selectedRow()
-                insert_at = (sel + 1) if sel >= 0 else len(model.items)
-                model.items.insert(insert_at, {"text": text, "done": False})
+                if sel >= 0:
+                    insert_at = _subtree_end(model.items, sel)
+                    level = int(model.items[sel].get("level", 0) or 0)
+                else:
+                    insert_at, level = len(model.items), 0
+                model.items.insert(insert_at, {"text": text, "done": False, "level": level})
                 input_field.setStringValue_("")
+                err.setStringValue_("")
                 table.reloadData()
                 table.selectRowIndexes_byExtendingSelection_(
                     NSIndexSet.indexSetWithIndex_(insert_at), False)
                 continue
-            if resp == _BTN2:
+            if resp == _BTN_CHILD:
+                text = _strip_task_prefix(input_field.stringValue())
+                sel = table.selectedRow()
+                if not text:
+                    err.setStringValue_("追加するタスクを入力してください")
+                    continue
+                if sel < 0:
+                    err.setStringValue_("親にする行を選択してください")
+                    continue
+                parent_level = int(model.items[sel].get("level", 0) or 0)
+                if parent_level >= MAX_TASK_LEVEL:
+                    err.setStringValue_(f"階層は{MAX_TASK_LEVEL + 1}層までです")
+                    continue
+                insert_at = _subtree_end(model.items, sel)   # 末っ子として
+                model.items.insert(insert_at, {"text": text, "done": False, "level": parent_level + 1})
+                input_field.setStringValue_("")
+                err.setStringValue_("")
+                table.reloadData()
+                table.selectRowIndexes_byExtendingSelection_(
+                    NSIndexSet.indexSetWithIndex_(insert_at), False)
+                continue
+            if resp in (_BTN_INDENT, _BTN_OUTDENT):
+                sel = table.selectedRow()
+                if sel < 0:
+                    err.setStringValue_("階層を変える行を選択してください")
+                    continue
+                sub = _subtree_indices(model.items, sel)
+                cur = int(model.items[sel].get("level", 0) or 0)
+                if resp == _BTN_INDENT:
+                    prev_level = int(model.items[sel - 1].get("level", 0) or 0) if sel > 0 else -1
+                    deepest = max(int(model.items[i].get("level", 0) or 0) for i in sub)
+                    if prev_level < cur:
+                        err.setStringValue_("上に同じ階層の行がないので下げられません")
+                        continue
+                    if deepest >= MAX_TASK_LEVEL:
+                        err.setStringValue_(f"階層は{MAX_TASK_LEVEL + 1}層までです")
+                        continue
+                    delta = 1
+                else:
+                    if cur == 0:
+                        err.setStringValue_("すでに一番上の階層です")
+                        continue
+                    delta = -1
+                for i in sub:
+                    model.items[i]["level"] = int(model.items[i].get("level", 0) or 0) + delta
+                _normalize_levels(model.items)
+                err.setStringValue_("")
+                table.reloadData()
+                table.selectRowIndexes_byExtendingSelection_(NSIndexSet.indexSetWithIndex_(sel), False)
+                win.makeFirstResponder_(table)
+                continue
+            if resp in (_BTN2, _BTN4):
                 sel = table.selectedRowIndexes()
                 if sel.count() == 0:
-                    err.setStringValue_("削除する行を選択してください")
+                    err.setStringValue_("削除する行を選択してください" if resp == _BTN2 else "翌日に移動する行を選択してください")
                     continue
                 count = sel.count()
-                idxs = []
+                picked = set()
                 idx = sel.firstIndex()
                 for _ in range(count):
-                    idxs.append(idx)
+                    picked.update(_subtree_indices(model.items, idx))   # 子孫ごと
                     idx = sel.indexGreaterThanIndex_(idx)
-                for idx in reversed(idxs):
+                moved = [model.items[i] for i in sorted(picked) if 0 <= i < len(model.items)]
+                for idx in sorted(picked, reverse=True):
                     if 0 <= idx < len(model.items):
                         model.items.pop(idx)
-                table.reloadData()
-                continue
-            if resp == _BTN4:
-                sel = table.selectedRowIndexes()
-                if sel.count() == 0:
-                    err.setStringValue_("翌日に移動する行を選択してください")
-                    continue
-                count = sel.count()
-                idxs = []
-                idx = sel.firstIndex()
-                for _ in range(count):
-                    idxs.append(idx)
-                    idx = sel.indexGreaterThanIndex_(idx)
-                for idx in reversed(idxs):
-                    if 0 <= idx < len(model.items):
-                        deferred_items.append(model.items.pop(idx))
-                err.setStringValue_(f"翌日に移動しました（{len(deferred_items)}件）")
+                _normalize_levels(model.items)
+                if resp == _BTN4:
+                    deferred_items.extend(moved)
+                    err.setStringValue_(f"翌日に移動しました（{len(deferred_items)}件）")
                 table.reloadData()
                 continue
             clean = []
             for item in model.items:
                 text = (item.get("text") or "").strip()
                 if text:
-                    clean.append({"text": text, "done": bool(item.get("done", False))})
+                    item["text"] = text
+                    item["done"] = bool(item.get("done", False))
+                    item["level"] = int(item.get("level", 0) or 0)
+                    clean.append(item)   # 同じ dict を使い回す（anchor を同一性で辿るため）
+            _normalize_levels(clean)
+            clean = _restore_done(clean, hidden)
             deferred_clean = [
-                {"text": (item.get("text") or "").strip(), "done": False}
+                {"text": (item.get("text") or "").strip(), "done": False,
+                 "level": int(item.get("level", 0) or 0)}
                 for item in deferred_items
                 if (item.get("text") or "").strip()
             ]
+            _normalize_levels(deferred_clean)
             return clean, deferred_clean
     finally:
+        _tree_editor_open[0] = False
         win.orderOut_(None)
         _hide()
 
@@ -1153,7 +1408,7 @@ def show_checkin(
 
     # ── 今日やりたいこと（ドラッグで並び替え可）──────────────────────────────
     cv.addSubview_(_label(
-        f"📅  今日やりたいこと — {_date_jp(_today_dt)}  （ダブルクリックで文面を編集）",
+        f"📅  今日やりたいこと — {_date_jp(_today_dt)}  （番号で指定・ダブルクリックで編集）",
         NSMakeRect(X + 20, today_label_y, W - X - 40, 20),
         NSFont.boldSystemFontOfSize_(13),
         color=NSColor.systemBlueColor(),
@@ -1258,12 +1513,8 @@ def show_checkin(
         task_to_index = {item["text"]: str(i + 1) for i, item in enumerate(today_items)}
         default_next = task_to_index.get(queued_task, "")
         if not default_next:
-            for i, item in enumerate(today_items):
-                if not item["done"]:
-                    default_next = str(i + 1)
-                    break
-        if not default_next:
-            default_next = "1"
+            _fi = _first_undone_index(today_items)
+            default_next = str(_fi + 1) if _fi is not None else "1"
 
     field_next     = _input_field(NSMakeRect(X + 20,  112, 95, 26), NSFont.systemFontOfSize_(15), placeholder="番号", default=default_next)
     field_next_next= _input_field(NSMakeRect(X + 123, 112, 95, 26), NSFont.systemFontOfSize_(15), placeholder="番号", default="")
@@ -1293,11 +1544,12 @@ def show_checkin(
     try:
         while True:
             resp = NSApp.runModalForWindow_(win)
-            updated_today = [
-                {"text": item["text"], "done": bool(item.get("done", False))}
+            updated_today = _normalize_levels([
+                {"text": item["text"], "done": bool(item.get("done", False)),
+                 "level": int(item.get("level", 0) or 0)}
                 for item in today_model.items
                 if (item.get("text") or "").strip()
-            ]
+            ])
             if resp in (_CANCEL, _BTN2):
                 return "break", None, None, None, None, updated_today
             if resp == _BTN3:
@@ -1403,7 +1655,7 @@ def show_history(history: list) -> None:
         if tasks:
             for task in tasks:
                 mark = "✅" if task.get("done") else "☐"
-                lines.append(f"  {mark}  {task.get('text', '')}")
+                lines.append(f"  {_task_prefix(task.get('level', 0))}{mark}  {task.get('text', '')}")
         else:
             lines.append("  (タスクなし)")
         lines.append("")
@@ -1798,7 +2050,7 @@ def show_weekly_review(
             lines.append(date_label)
             for task in tasks:
                 mark = "✅" if task.get("done") else "☐"
-                lines.append(f"  {mark}  {task.get('text', '')}")
+                lines.append(f"  {_task_prefix(task.get('level', 0))}{mark}  {task.get('text', '')}")
             lines.append("")
     else:
         lines = ["先週の記録はありません。"]
@@ -2503,8 +2755,13 @@ class ProgressChecker(rumps.App):
         old_tasks = _normalize_today(self.data["goals"].get("today", []))
         self._add_to_history(old_date, old_tasks)
         # Carry over undone tasks from the previous day
-        carryover = [{"text": t["text"], "done": False}
-                     for t in old_tasks if not t.get("done")]
+        # 未完了の行、または未完了の子孫を持つ親（文脈として残す）を繰り越す
+        carryover = [
+            {"text": t["text"], "done": False, "level": int(t.get("level", 0) or 0)}
+            for i, t in enumerate(old_tasks)
+            if any(not old_tasks[j].get("done") for j in _subtree_indices(old_tasks, i))
+        ]
+        _normalize_levels(carryover)
         carryover_texts = {t["text"] for t in carryover}
         # Add today's weekday tasks from the weekly plan (skip duplicates).
         # If the week also changed, the plan is stale — a fresh one gets made
@@ -2525,8 +2782,10 @@ class ProgressChecker(rumps.App):
             for t in deferred:
                 text = (t.get("text") or "") if isinstance(t, dict) else str(t)
                 if text and text not in existing_texts:
-                    new_today.append({"text": text, "done": False})
+                    lv = int(t.get("level", 0) or 0) if isinstance(t, dict) else 0
+                    new_today.append({"text": text, "done": False, "level": lv})
                     existing_texts.add(text)
+        _normalize_levels(new_today)
         self.data["today_date"] = today_str
         self.data["goals"]["today"] = new_today
         # Reset daily retro reminder tracking for the new day
@@ -2822,7 +3081,8 @@ class ProgressChecker(rumps.App):
                     self.data["goals"]["today"] = today_items
                     if not self.data.get("next_task"):
                         next_undone = next(
-                            (t["text"] for t in today_items[current_idx + 1:] if not t["done"]),
+                            (today_items[_j]["text"] for _j in [_first_undone_index(today_items, current_idx + 1)]
+                             if _j is not None),
                             None)
                         if next_undone:
                             self.data["next_task"] = next_undone
