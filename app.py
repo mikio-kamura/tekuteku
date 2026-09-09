@@ -15,9 +15,11 @@ except Exception:
     pass
 
 import objc
+import time
 import rumps
-from Foundation import NSObject, NSRunLoop, NSTimer, NSRunLoopCommonModes, NSIndexSet
+from Foundation import NSObject, NSRunLoop, NSTimer, NSRunLoopCommonModes, NSIndexSet, NSDistributedNotificationCenter
 from AppKit import (
+    NSAlert,
     NSApp,
     NSAppearance,
     NSAttributedString,
@@ -34,6 +36,7 @@ from AppKit import (
     NSMenuItem,
     NSPanel,
     NSEventModifierFlagCommand,
+    NSEventModifierFlagControl,
     NSEventModifierFlagShift,
     NSEventTrackingRunLoopMode,
     NSPasteboardTypeString,
@@ -55,6 +58,9 @@ from AppKit import (
 DATA_FILE = os.path.expanduser("~/.tekuteku.json")
 _OLD_DATA_FILE = os.path.expanduser("~/.progress_checker.json")
 DEFAULT_INTERVAL = 20  # minutes
+CHECKIN_NOTIFICATION = "jp.tekuteku.checkin-now"      # 外部から「今すぐチェックイン」を起こす分散通知（trigger.sh）
+EDIT_TODAY_NOTIFICATION = "jp.tekuteku.edit-today"    # 外部から「細分タスク編集」を開く分散通知
+TRIGGER_MAX_AGE_SEC = 3.0  # これより古い通知は捨てる（ダイアログ中に届いた通知は閉じた後にまとめて配送されるため）
 BREAK_MINUTES = 5
 WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 WEEKDAY_JP    = ["月",  "火",  "水",  "木",  "金",  "土",  "日"]
@@ -76,6 +82,8 @@ _BTN_EDIT_WEEKLY, _BTN_EDIT_SHORT, _BTN_EDIT_MID, _BTN_EDIT_LONG = 1004, 1005, 1
 _BTN_START_SESSION = 1008
 _BTN_CHILD, _BTN_OUTDENT, _BTN_INDENT = 1009, 1010, 1011  # 細分タスクのツリー操作
 _BTN_MOVE_UP, _BTN_MOVE_DOWN = 1012, 1013  # 部分木を兄弟の前後へ
+_NEW_ROW_CLEAR = [True]
+_BTN_ENTER_ROW = 1014  # Enter：選択行の下に同じ階層で新しい行を作って編集開始
 _tree_editor_open = [False]  # 細分タスク編集中は ⌘Enter を「子として追加」にする
 MAX_TASK_LEVEL = 2  # 0,1,2 の3層
 _CANCEL = -1
@@ -589,12 +597,38 @@ def _task_prefix(level: int) -> str:
     return ("　" * level + "└ ") if level else ""
 
 
+_ZWSP = "\u200b"   # 新行の編集開始時に入れる見えない1文字（下記コメント参照）
+
+
 def _strip_task_prefix(text: str) -> str:
-    return (text or "").lstrip("　 └").strip()
+    return (text or "").replace(_ZWSP, "").lstrip("　 └").strip()
 
 
 def _is_leaf(items: list, i: int) -> bool:
     return len(_subtree_indices(items, i)) == 1
+
+
+def _next_task_index(items: list) -> Optional[int]:
+    """「次のセッション」の番号：チェックされていない一番若い行。
+    ただし未完了の子孫を残している親は（先に子をやるものなので）飛ばす。"""
+    for i, it in enumerate(items):
+        if it.get("done"):
+            continue
+        if all(items[j].get("done") for j in _subtree_indices(items, i)[1:]):
+            return i
+    return None
+
+
+def _is_fresh_trigger(user_info, now: Optional[float] = None) -> bool:
+    """分散通知の userInfo["t"]（送信時刻 epoch 秒）が新しいか。時刻なしは新しい扱い。"""
+    if not user_info:
+        return True
+    try:
+        t = float(user_info.get("t"))
+    except (TypeError, ValueError):
+        return True
+    now = time.time() if now is None else now
+    return (now - t) <= TRIGGER_MAX_AGE_SEC
 
 
 def _first_undone_index(items: list, start: int = 0) -> Optional[int]:
@@ -718,6 +752,8 @@ class _TodayTaskTableModel(NSObject):
                 done = bool(value)
                 for i in _subtree_indices(self.items, row):
                     self.items[i]["done"] = done
+                if self.on_done_changed is not None:
+                    self.on_done_changed()
             else:
                 text = _strip_task_prefix(str(value or ""))
                 if self.show_numbers and text and text[0].isdigit():
@@ -725,6 +761,31 @@ class _TodayTaskTableModel(NSObject):
                     if dot_idx > 0 and text[:dot_idx].isdigit():
                         text = text[dot_idx + 2:]
                 self.items[row]["text"] = text
+
+    on_done_changed = None   # チェックボックスが変わったとき（チェックイン画面が「次のセッション」を更新する）
+
+    # セル編集中のキー（Enter / Esc / Ctrl+P,N）。編集画面が on_command(name, row) を差し込む。
+    # 戻り値 True なら処理済み。名前は "enter" / "cancel" / "up" / "down"
+    on_command = None
+
+    def control_textView_doCommandBySelector_(self, control, tv, selector):
+        if self.on_command is None:
+            return False
+        sel = str(selector)
+        name = {"cancelOperation:": "cancel", "moveUp:": "up", "moveDown:": "down",
+                "insertTab:": "indent", "insertBacktab:": "outdent"}.get(sel)
+        if sel == "insertNewline:":
+            ev = NSApp.currentEvent()
+            shift = bool(ev is not None and ev.modifierFlags() & NSEventModifierFlagShift)
+            if not shift:
+                return False          # ふつうの Enter は編集の確定だけ（既定の動き）
+            name = "newrow"           # ⇧Enter：確定して下に同じ階層の行を追加
+        if name is None:
+            return False
+        row = control.editedRow() if hasattr(control, "editedRow") else -1
+        if name != "cancel" and 0 <= row < len(self.items):
+            self.items[row]["text"] = _strip_task_prefix(tv.string())
+        return bool(self.on_command(name, row))
 
     def tableView_writeRowsWithIndexes_toPasteboard_(self, _table, row_indexes, pasteboard):
         count = row_indexes.count()
@@ -771,26 +832,71 @@ class _TodayTaskTableModel(NSObject):
         return True
 
 
-class _TreeTableView(NSTableView):
-    """細分タスク編集用：Tab/Shift+Tab で階層、⌘↑↓ で兄弟間の移動、Delete で削除。
-    キーはモーダルの応答コードに変換して、ボタンと同じ経路で処理する。"""
+def _confirm_delete(names: list[str], n_children: int) -> bool:
+    """削除の確認。Enter で削除、Esc でやめる。"""
+    alert = NSAlert.alloc().init()
+    head = "、".join(f"「{_truncate10(n)}」" for n in names[:3]) + ("…" if len(names) > 3 else "")
+    alert.setMessageText_(f"{head} を削除しますか？")
+    info = f"子タスク {n_children} 件も一緒に消えます。" if n_children else "この操作は取り消せません。"
+    alert.setInformativeText_(info + "　Enter: 削除　Esc: やめる")
+    if os.path.exists(SAM_IMG):
+        _img = NSImage.alloc().initByReferencingFile_(SAM_IMG)
+        if _img:
+            alert.setIcon_(_img)
+    alert.addButtonWithTitle_("削除")        # 1000 = 既定ボタン（Enter）
+    cancel = alert.addButtonWithTitle_("やめる")  # 1001
+    cancel.setKeyEquivalent_("\x1b")          # Esc
+    return alert.runModal() == 1000
+
+
+_BTN_SEL_UP, _BTN_SEL_DOWN = 1015, 1016  # Ctrl+P / Ctrl+N：選択行を上下へ
+_BTN_EDIT_ROW = 1017  # Enter：選択行の文面を編集
+_BTN_TOGGLE_PARALLEL = 1018  # 振り返り：p キーで並行タスク完了の切替
+
+
+class _SyncScrollTableView(NSTableView):
+    """responsive scrolling（AppKit の先読み・非同期描画）を使わないテーブル。
+    モーダルダイアログの中では先読み分の描画が指を離すまで反映されないことがあるため、
+    昔ながらの同期描画でスクロールする。"""
+    @classmethod
+    def isCompatibleWithResponsiveScrolling(cls):
+        return False
+
+
+class _TreeTableView(_SyncScrollTableView):
+    """細分タスク編集用：Tab/Shift+Tab で階層、⌘↑↓ で兄弟間の移動、Enter で行追加、
+    Delete で削除、Ctrl+P/N で選択移動。
+    on_key(code) が差し込まれていればモーダルを止めずにその場で処理する（画面が薄くならない）。"""
+    on_key = None
+
     def keyDown_(self, event):
         code = event.keyCode()
         flags = event.modifierFlags()
         shift = bool(flags & NSEventModifierFlagShift)
         cmd = bool(flags & NSEventModifierFlagCommand)
+        ctrl = bool(flags & NSEventModifierFlagControl)
         resp = None
         if code == 48:                       # Tab
             resp = _BTN_OUTDENT if shift else _BTN_INDENT
+        elif code in (36, 76):               # Return / Enter
+            resp = _BTN_ENTER_ROW if shift else _BTN_EDIT_ROW   # ⇧⏎: 行追加 / ⏎: 編集
         elif code in (51, 117) and self.selectedRow() >= 0:   # Delete / fn+Delete
             resp = _BTN2
         elif cmd and code == 126:            # ⌘↑
             resp = _BTN_MOVE_UP
         elif cmd and code == 125:            # ⌘↓
             resp = _BTN_MOVE_DOWN
-        if resp is not None and NSApp.modalWindow() is self.window():
-            NSApp.stopModalWithCode_(resp)
-            return
+        elif ctrl and code == 35:            # Ctrl+P
+            resp = _BTN_SEL_UP
+        elif ctrl and code == 45:            # Ctrl+N
+            resp = _BTN_SEL_DOWN
+        if resp is not None:
+            if self.on_key is not None:
+                self.on_key(resp)
+                return
+            if NSApp.modalWindow() is self.window():
+                NSApp.stopModalWithCode_(resp)
+                return
         objc.super(_TreeTableView, self).keyDown_(event)
 
 
@@ -838,13 +944,40 @@ class _VCenteredCell(NSTextFieldCell):
 
 class _KeyWindow(NSWindow):
     """NSWindow subclass that handles edit key equivalents directly.
-    Necessary for LSUIElement apps where the main menu bar is inactive."""
+    Necessary for LSUIElement apps where the main menu bar is inactive.
+    key_codes = {"1": _BTN1, ...} を入れると、そのキー（素押し／⌘付き）でボタンと同じ応答を返す。"""
+    key_codes = None
+
+    def _fire_key_code(self, char) -> bool:
+        code = (self.key_codes or {}).get(char)
+        if code is None or NSApp.modalWindow() is not self:
+            return False
+        NSApp.stopModalWithCode_(code)
+        return True
+
+    def keyDown_(self, event):
+        # テキスト入力中は届かない（フィールドエディタが先に受ける）ので、ボタンだけの画面向け
+        if self._fire_key_code(event.charactersIgnoringModifiers()):
+            return
+        objc.super(_KeyWindow, self).keyDown_(event)
+
+    def cancelOperation_(self, sender):
+        # Esc。テキスト欄にカーソルがあっても、フィールドエディタ→responder chain でここに届く
+        if self._fire_key_code("\x1b"):
+            return
+        try:
+            objc.super(_KeyWindow, self).cancelOperation_(sender)
+        except AttributeError:
+            pass
+
     def performKeyEquivalent_(self, event):
         flags = event.modifierFlags()
         char = event.charactersIgnoringModifiers()
         if flags & NSEventModifierFlagCommand:
+            if self._fire_key_code(char):
+                return True
             if _tree_editor_open[0] and char in ("\r", "\x03") and NSApp.modalWindow() is self:
-                NSApp.stopModalWithCode_(_BTN_CHILD)
+                NSApp.stopModalWithCode_(_BTN1)   # 細分タスク編集の「決定」
                 return True
             if (flags & NSEventModifierFlagShift) and char == "z":
                 if NSApp.sendAction_to_from_("redo:", None, None):
@@ -1109,15 +1242,15 @@ def show_today_task_editor(title: str, items: list[dict]) -> Optional[tuple]:
     cv = win.contentView()
     cv.addSubview_(_label("今日行う細分タスク（3層のツリー）",
                           NSMakeRect(20, H - 32, W-40, 20), NSFont.boldSystemFontOfSize_(13)))
-    cv.addSubview_(_label("Tab/⇧Tab: 階層　⌘↑↓: 移動　⌫: 削除　⌘⏎: 子として追加　ドラッグ・ダブルクリックも可",
+    cv.addSubview_(_label("⏎: 編集　⇧⏎: 下に行追加（Esc取消）　Tab/⇧Tab: 階層　⌘↑↓: 移動　^P/^N: 選択　⌫: 削除　⌘⏎: 決定",
                           NSMakeRect(20, H - 50, W-40, 16), NSFont.systemFontOfSize_(11),
                           color=NSColor.colorWithWhite_alpha_(0.45, 1.0)))
 
     # 完了済みは編集画面では隠す。直前の未完了行（anchor）との相対位置を覚えて、決定時に戻す
     visible, hidden = _split_done(_normalize_today(items))
     model = _TodayTaskTableModel.alloc().initWithItems_(visible)
-    TABLE_H = 224
-    TABLE_Y = H - 58 - TABLE_H
+    TABLE_Y = 70
+    TABLE_H = H - 58 - TABLE_Y
     scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(20, TABLE_Y, W - 40, TABLE_H))
     scroll.setHasVerticalScroller_(True)
     scroll.setAutohidesScrollers_(True)
@@ -1139,18 +1272,7 @@ def show_today_task_editor(title: str, items: list[dict]) -> Optional[tuple]:
     scroll.setDocumentView_(table)
     cv.addSubview_(scroll)
 
-    input_field = _input_field(NSMakeRect(20, TABLE_Y - 38, W - 236, 30), NSFont.systemFontOfSize_(14),
-                               placeholder="細分タスクを入力して追加（選択行の下に同じ階層で）")
-    cv.addSubview_(input_field)
-    _btn(cv, "追加",   _BTN3,       NSMakeRect(W - 206, TABLE_Y - 38, 60, 30))
-    _btn(cv, "子として追加", _BTN_CHILD, NSMakeRect(W - 140, TABLE_Y - 38, 120, 30))
-
-    # 2段目：階層の上げ下げ・削除
-    ROW2_Y = TABLE_Y - 74
-    _btn(cv, "◀ 上の階層へ", _BTN_OUTDENT, NSMakeRect(20, ROW2_Y, 110, 28))
-    _btn(cv, "▶ 下の階層へ", _BTN_INDENT,  NSMakeRect(136, ROW2_Y, 110, 28))
-    _btn(cv, "削除", _BTN2, NSMakeRect(W - 74, ROW2_Y, 54, 28))
-    err = _label("", NSMakeRect(20, ROW2_Y - 20, W - 40, 16), NSFont.systemFontOfSize_(12), color=NSColor.systemOrangeColor())
+    err = _label("", NSMakeRect(20, TABLE_Y - 24, W - 40, 16), NSFont.systemFontOfSize_(12), color=NSColor.systemOrangeColor())
     cv.addSubview_(err)
 
     _btn(cv, "📅 翌日に移動", _BTN4, NSMakeRect(20, 10, 128, 28))
@@ -1158,120 +1280,199 @@ def show_today_task_editor(title: str, items: list[dict]) -> Optional[tuple]:
         cv.addSubview_(_label(f"完了済み {len(hidden)} 件は非表示（チェックイン画面で戻せます）",
                               NSMakeRect(156, 14, W - 156 - 130, 16), NSFont.systemFontOfSize_(11),
                               color=NSColor.colorWithWhite_alpha_(0.45, 1.0)))
-    _btn(cv, "決定", _BTN1, NSMakeRect(W - 136, 10, 116, 28), primary=False)
-    # Enter in input field should add item, not submit dialog.
-    input_field.setTag_(_BTN3)
-    input_field.setTarget_(_H)
-    input_field.setAction_("click:")
-    win.setInitialFirstResponder_(input_field)
+    _btn(cv, "決定（⌘⏎）", _BTN1, NSMakeRect(W - 136, 10, 116, 28), primary=False)
+    win.setInitialFirstResponder_(table)
     deferred_items: list = []
     _tree_editor_open[0] = True
+    pending = {"row": None}   # Enter で作った編集中の新行（Esc で取り消せる）
+
+    def select_row(i: int):
+        if not model.items:
+            table.deselectAll_(None)
+            return
+        i = max(0, min(len(model.items) - 1, i))
+        table.selectRowIndexes_byExtendingSelection_(NSIndexSet.indexSetWithIndex_(i), False)
+        table.scrollRowToVisible_(i)
+        win.makeFirstResponder_(table)
+
+    def selected_indices() -> list[int]:
+        sel = table.selectedRowIndexes()
+        out, idx = [], sel.firstIndex()
+        for _ in range(sel.count()):
+            out.append(idx)
+            idx = sel.indexGreaterThanIndex_(idx)
+        return out
+
+    def begin_edit(row: int, select_all: bool = True):
+        """row の文面編集を始める。文面が空なら、インデント記号を消して打てる状態にする。
+        完全に空にすると、セル方式の NSTableView が編集欄の空文字に反応して他の行の文字まで
+        灰色に描くので、見えないゼロ幅スペースを1文字だけ選択状態で入れておく（確定時に除去）。"""
+        if not (0 <= row < len(model.items)):
+            return
+        select_row(row)
+        table.editColumn_row_withEvent_select_(0, row, None, select_all)
+        fe = win.fieldEditor_forObject_(False, None)
+        if fe is None:
+            return
+        if not (model.items[row].get("text") or "").strip():
+            if _NEW_ROW_CLEAR[0]:
+                fe.setString_(_ZWSP)
+                fe.setSelectedRange_((0, 1))
+        elif not select_all:
+            fe.setSelectedRange_((len(fe.string()), 0))   # 末尾にカーソル
+
+    def handle(resp) -> bool:
+        """ボタン／キーの1操作を処理する。True なら編集を続行（ループへ戻る）。"""
+        if resp == _BTN_EDIT_ROW:
+            sel = table.selectedRow()
+            if sel < 0 and not model.items:
+                return handle(_BTN_ENTER_ROW)   # 何もないときの Enter は最初の行を作る
+            if sel < 0:
+                select_row(0)
+                return True
+            begin_edit(sel, select_all=True)
+            return True
+        if resp == _BTN_ENTER_ROW:
+            sel = table.selectedRow()
+            if sel >= 0 and not (model.items[sel].get("text") or "").strip():
+                # 空の行で ⇧Enter → その行の編集を続ける（空行を積み重ねない）
+                begin_edit(sel)
+                return True
+            if sel >= 0:
+                insert_at = _subtree_end(model.items, sel)
+                level = int(model.items[sel].get("level", 0) or 0)
+            else:
+                insert_at, level = len(model.items), 0
+            model.items.insert(insert_at, {"text": "", "done": False, "level": level})
+            err.setStringValue_("")
+            table.reloadData()
+            pending["row"] = insert_at
+            begin_edit(insert_at)
+            return True
+        if resp in (_BTN_SEL_UP, _BTN_SEL_DOWN):
+            sel = table.selectedRow()
+            if sel < 0:
+                select_row(0 if resp == _BTN_SEL_DOWN else len(model.items) - 1)
+            else:
+                select_row(sel + (-1 if resp == _BTN_SEL_UP else 1))
+            return True
+        if resp in (_BTN_MOVE_UP, _BTN_MOVE_DOWN):
+            sel = table.selectedRow()
+            if sel < 0:
+                err.setStringValue_("移動する行を選択してください")
+                return True
+            new_i = _move_subtree(model.items, sel, -1 if resp == _BTN_MOVE_UP else 1)
+            table.reloadData()
+            select_row(new_i)
+            return True
+        if resp in (_BTN_INDENT, _BTN_OUTDENT):
+            sel = table.selectedRow()
+            if sel < 0:
+                err.setStringValue_("階層を変える行を選択してください")
+                return True
+            sub = _subtree_indices(model.items, sel)
+            cur = int(model.items[sel].get("level", 0) or 0)
+            if resp == _BTN_INDENT:
+                prev_level = int(model.items[sel - 1].get("level", 0) or 0) if sel > 0 else -1
+                deepest = max(int(model.items[i].get("level", 0) or 0) for i in sub)
+                if prev_level < cur:
+                    err.setStringValue_("上に同じ階層の行がないので下げられません")
+                    return True
+                if deepest >= MAX_TASK_LEVEL:
+                    err.setStringValue_(f"階層は{MAX_TASK_LEVEL + 1}層までです")
+                    return True
+                delta = 1
+            else:
+                if cur == 0:
+                    err.setStringValue_("すでに一番上の階層です")
+                    return True
+                delta = -1
+            for i in sub:
+                model.items[i]["level"] = int(model.items[i].get("level", 0) or 0) + delta
+            _normalize_levels(model.items)
+            err.setStringValue_("")
+            table.reloadData()
+            select_row(sel)
+            return True
+        if resp in (_BTN2, _BTN4):
+            sel_idxs = selected_indices()
+            if not sel_idxs:
+                err.setStringValue_("削除する行を選択してください" if resp == _BTN2 else "翌日に移動する行を選択してください")
+                return True
+            picked = set()
+            for i in sel_idxs:
+                picked.update(_subtree_indices(model.items, i))   # 子孫ごと
+            moved = [model.items[i] for i in sorted(picked) if 0 <= i < len(model.items)]
+            if resp == _BTN2:
+                names = [model.items[i]["text"] for i in sel_idxs
+                         if 0 <= i < len(model.items) and (model.items[i].get("text") or "").strip()]
+                if names and not _confirm_delete(names, len(picked) - len(sel_idxs)):
+                    win.makeFirstResponder_(table)
+                    return True
+            for idx in sorted(picked, reverse=True):
+                if 0 <= idx < len(model.items):
+                    model.items.pop(idx)
+            _normalize_levels(model.items)
+            if resp == _BTN4:
+                deferred_items.extend(moved)
+                err.setStringValue_(f"翌日に移動しました（{len(deferred_items)}件）")
+            table.reloadData()
+            select_row(min(sel_idxs))
+            return True
+        return False   # 決定
+
+    def on_command(name: str, row: int) -> bool:
+        """セル編集中のキー。編集を終えてから handle に渡す。"""
+        if name == "cancel":
+            if pending["row"] is not None and pending["row"] == row:
+                # Enter で作った行を Esc で取り消す
+                win.makeFirstResponder_(table)      # 編集終了
+                if 0 <= row < len(model.items):
+                    model.items.pop(row)
+                pending["row"] = None
+                table.reloadData()
+                select_row(row - 1)
+                return True
+            return False   # ふつうの編集は既定どおり（変更を捨てて編集終了）
+        was_pending = pending["row"] == row
+        pending["row"] = None
+        win.makeFirstResponder_(table)   # 編集を確定
+        if name in ("indent", "outdent"):
+            # 編集中の Tab/⇧Tab：階層を変えて、同じ行の編集をそのまま続ける
+            handle(_BTN_INDENT if name == "indent" else _BTN_OUTDENT)
+            if was_pending:
+                pending["row"] = row
+            begin_edit(row, select_all=False)
+            return True
+        if name == "newrow":
+            handle(_BTN_ENTER_ROW)
+        elif name == "up":
+            handle(_BTN_SEL_UP)
+        elif name == "down":
+            handle(_BTN_SEL_DOWN)
+        return True
+
+    def on_key(resp):
+        pending["row"] = None
+        if resp == _BTN2:
+            # 削除確認（NSAlert）はキー処理の中で開くと即返ってしまうので、
+            # モーダルを一度止めてループ側（ボタンと同じ経路）で出す
+            if NSApp.modalWindow() is win:
+                NSApp.stopModalWithCode_(_BTN2)
+            return
+        handle(resp)
+
+    model.on_command = on_command
+    table.on_key = on_key
     _show(win)
     try:
         while True:
             resp = NSApp.runModalForWindow_(win)
             if resp == _CANCEL:
                 return None
-            if resp in (_BTN_MOVE_UP, _BTN_MOVE_DOWN):
-                sel = table.selectedRow()
-                if sel < 0:
-                    err.setStringValue_("移動する行を選択してください")
-                    continue
-                new_i = _move_subtree(model.items, sel, -1 if resp == _BTN_MOVE_UP else 1)
-                table.reloadData()
-                table.selectRowIndexes_byExtendingSelection_(NSIndexSet.indexSetWithIndex_(new_i), False)
-                win.makeFirstResponder_(table)
+            if handle(resp):
                 continue
-            if resp == _BTN3:
-                text = input_field.stringValue().strip()
-                if not text:
-                    err.setStringValue_("追加するタスクを入力してください")
-                    continue
-                sel = table.selectedRow()
-                if sel >= 0:
-                    insert_at = _subtree_end(model.items, sel)
-                    level = int(model.items[sel].get("level", 0) or 0)
-                else:
-                    insert_at, level = len(model.items), 0
-                model.items.insert(insert_at, {"text": text, "done": False, "level": level})
-                input_field.setStringValue_("")
-                err.setStringValue_("")
-                table.reloadData()
-                table.selectRowIndexes_byExtendingSelection_(
-                    NSIndexSet.indexSetWithIndex_(insert_at), False)
-                continue
-            if resp == _BTN_CHILD:
-                text = _strip_task_prefix(input_field.stringValue())
-                sel = table.selectedRow()
-                if not text:
-                    err.setStringValue_("追加するタスクを入力してください")
-                    continue
-                if sel < 0:
-                    err.setStringValue_("親にする行を選択してください")
-                    continue
-                parent_level = int(model.items[sel].get("level", 0) or 0)
-                if parent_level >= MAX_TASK_LEVEL:
-                    err.setStringValue_(f"階層は{MAX_TASK_LEVEL + 1}層までです")
-                    continue
-                insert_at = _subtree_end(model.items, sel)   # 末っ子として
-                model.items.insert(insert_at, {"text": text, "done": False, "level": parent_level + 1})
-                input_field.setStringValue_("")
-                err.setStringValue_("")
-                table.reloadData()
-                table.selectRowIndexes_byExtendingSelection_(
-                    NSIndexSet.indexSetWithIndex_(insert_at), False)
-                continue
-            if resp in (_BTN_INDENT, _BTN_OUTDENT):
-                sel = table.selectedRow()
-                if sel < 0:
-                    err.setStringValue_("階層を変える行を選択してください")
-                    continue
-                sub = _subtree_indices(model.items, sel)
-                cur = int(model.items[sel].get("level", 0) or 0)
-                if resp == _BTN_INDENT:
-                    prev_level = int(model.items[sel - 1].get("level", 0) or 0) if sel > 0 else -1
-                    deepest = max(int(model.items[i].get("level", 0) or 0) for i in sub)
-                    if prev_level < cur:
-                        err.setStringValue_("上に同じ階層の行がないので下げられません")
-                        continue
-                    if deepest >= MAX_TASK_LEVEL:
-                        err.setStringValue_(f"階層は{MAX_TASK_LEVEL + 1}層までです")
-                        continue
-                    delta = 1
-                else:
-                    if cur == 0:
-                        err.setStringValue_("すでに一番上の階層です")
-                        continue
-                    delta = -1
-                for i in sub:
-                    model.items[i]["level"] = int(model.items[i].get("level", 0) or 0) + delta
-                _normalize_levels(model.items)
-                err.setStringValue_("")
-                table.reloadData()
-                table.selectRowIndexes_byExtendingSelection_(NSIndexSet.indexSetWithIndex_(sel), False)
-                win.makeFirstResponder_(table)
-                continue
-            if resp in (_BTN2, _BTN4):
-                sel = table.selectedRowIndexes()
-                if sel.count() == 0:
-                    err.setStringValue_("削除する行を選択してください" if resp == _BTN2 else "翌日に移動する行を選択してください")
-                    continue
-                count = sel.count()
-                picked = set()
-                idx = sel.firstIndex()
-                for _ in range(count):
-                    picked.update(_subtree_indices(model.items, idx))   # 子孫ごと
-                    idx = sel.indexGreaterThanIndex_(idx)
-                moved = [model.items[i] for i in sorted(picked) if 0 <= i < len(model.items)]
-                for idx in sorted(picked, reverse=True):
-                    if 0 <= idx < len(model.items):
-                        model.items.pop(idx)
-                _normalize_levels(model.items)
-                if resp == _BTN4:
-                    deferred_items.extend(moved)
-                    err.setStringValue_(f"翌日に移動しました（{len(deferred_items)}件）")
-                table.reloadData()
-                continue
+            win.makeFirstResponder_(table)   # 編集中なら文面を確定
             clean = []
             for item in model.items:
                 text = (item.get("text") or "").strip()
@@ -1322,8 +1523,8 @@ def show_checkin(
     n = len(today_items)
 
     X = 220           # left image column width (2× for larger character)
-    ITEM_H = 22       # NSTableView row height
-    MAX_VIS = 5       # max rows before scroll kicks in
+    ITEM_H = 22       # 1行の高さ（rowHeight 20 + 行間 2。下の intercellSpacing と揃える）
+    MAX_VIS = 8       # これ以上はスクロール（ツリーで行が増えたので 5→8）
     GAP = 6
     FIXED_BOTTOM = 428
     items_bottom_y = FIXED_BOTTOM + GAP
@@ -1408,7 +1609,7 @@ def show_checkin(
 
     # ── 今日やりたいこと（ドラッグで並び替え可）──────────────────────────────
     cv.addSubview_(_label(
-        f"📅  今日やりたいこと — {_date_jp(_today_dt)}  （番号で指定・ダブルクリックで編集）",
+        f"📅  今日やりたいこと — {_date_jp(_today_dt)}  （番号で指定・Esc: 細分タスク編集）",
         NSMakeRect(X + 20, today_label_y, W - X - 40, 20),
         NSFont.boldSystemFontOfSize_(13),
         color=NSColor.systemBlueColor(),
@@ -1420,9 +1621,14 @@ def show_checkin(
     scroll.setHasVerticalScroller_(n > MAX_VIS)
     scroll.setAutohidesScrollers_(True)
     scroll.setBorderType_(2)
+    scroll.setUsesPredominantAxisScrolling_(True)
+    scroll.setHorizontalScrollElasticity_(1)  # NSScrollElasticityNone（横に揺れない）
     table_w = W - X - 60
-    today_table = NSTableView.alloc().initWithFrame_(NSMakeRect(0, 0, table_w, scroll_h))
+    # モーダル中は responsive scrolling（先読み描画）が「指を離すまで描き変わらない」症状を出すので、
+    # それを切った NSTableView を使う（同期描画）
+    today_table = _SyncScrollTableView.alloc().initWithFrame_(NSMakeRect(0, 0, table_w, scroll_h))
     today_table.setRowHeight_(float(ITEM_H - 2))
+    today_table.setIntercellSpacing_((3.0, 2.0))   # 行ピッチを ITEM_H=22 に一致させる（半端な行が出ない）
     # Checkbox column
     _done_col = NSTableColumn.alloc().initWithIdentifier_("done")
     _done_col.setWidth_(22)
@@ -1508,13 +1714,10 @@ def show_checkin(
     cv.addSubview_(_label("同時タスク（任意）", NSMakeRect(X + 123, 132, 100, 16), NSFont.systemFontOfSize_(12)))
     cv.addSubview_(_label("⏱分",           NSMakeRect(X + 230, 132, 40, 16), NSFont.systemFontOfSize_(12)))
 
-    default_next = ""
-    if today_items:
-        task_to_index = {item["text"]: str(i + 1) for i, item in enumerate(today_items)}
-        default_next = task_to_index.get(queued_task, "")
-        if not default_next:
-            _fi = _first_undone_index(today_items)
-            default_next = str(_fi + 1) if _fi is not None else "1"
+    def _next_default() -> str:
+        _fi = _next_task_index(today_model.items)
+        return str(_fi + 1) if _fi is not None else ""
+    default_next = _next_default()
 
     field_next     = _input_field(NSMakeRect(X + 20,  112, 95, 26), NSFont.systemFontOfSize_(15), placeholder="番号", default=default_next)
     field_next_next= _input_field(NSMakeRect(X + 123, 112, 95, 26), NSFont.systemFontOfSize_(15), placeholder="番号", default="")
@@ -1522,6 +1725,8 @@ def show_checkin(
     cv.addSubview_(field_next)
     cv.addSubview_(field_next_next)
     cv.addSubview_(field_session)
+    # チェックを付け外ししたら「次のセッション」を常に未完了の一番若い番号へ
+    today_model.on_done_changed = lambda: field_next.setStringValue_(_next_default())
 
     cv.addSubview_(_label("コメント（メニューバーに表示）", NSMakeRect(X + 20, 90, W - X - 40, 16), NSFont.systemFontOfSize_(12)))
     field_msg = _input_field(NSMakeRect(X + 20, 64, W - X - 40, 24), NSFont.systemFontOfSize_(14),
@@ -1533,7 +1738,8 @@ def show_checkin(
     # ── ボタン ──────────────────────────────────────────────────────────────
     _btn(cv, "スタート！",                _BTN1, NSMakeRect(W - 160, 8, 140, 28), primary=True)
     _btn(cv, f"☕  {BREAK_MINUTES}分休憩", _BTN2, NSMakeRect(W - 312, 8, 140, 28))
-    _btn(cv, "📝 細分タスク編集",          _BTN3, NSMakeRect(X + 20, 8, 128, 28))
+    _btn(cv, "📝 細分タスク編集 (Esc)",    _BTN3, NSMakeRect(X + 20, 8, 150, 28))
+    win.key_codes = {"\x1b": _BTN3}   # Esc → 細分タスク編集（ボタンと同じ）
 
     field_next.setNextKeyView_(field_next_next)
     field_next_next.setNextKeyView_(field_session)
@@ -1611,17 +1817,26 @@ def show_feedback(task: str, parallel_task: str = "") -> tuple:
         short_p = (parallel_task[:36] + "…") if len(parallel_task) > 36 else parallel_task
         parallel_check = NSButton.alloc().initWithFrame_(NSMakeRect(20, 94, W - 40, 24))
         parallel_check.setButtonType_(3)  # NSSwitchButton = checkbox
-        parallel_check.setTitle_(f"並行「{short_p}」も完了")
+        parallel_check.setTitle_(f"並行「{short_p}」も完了 (b)")
         parallel_check.setState_(0)
         cv.addSubview_(parallel_check)
 
     bw = (W - 40 - 16) // 3
-    _btn(cv, "✅  完了！",     _BTN1, NSMakeRect(20,            16, bw, 36))
-    _btn(cv, "🌱  少し進んだ", _BTN2, NSMakeRect(20 + bw + 8,   16, bw, 36))
-    _btn(cv, "🔄  方針変更",   _BTN3, NSMakeRect(20 + (bw+8)*2, 16, bw, 36))
+    _btn(cv, "✅ 完了！ (d)",     _BTN1, NSMakeRect(20,            16, bw, 36))
+    _btn(cv, "🌱 少し進んだ (p)", _BTN2, NSMakeRect(20 + bw + 8,   16, bw, 36))
+    _btn(cv, "🔄 方針転換 (n)",   _BTN3, NSMakeRect(20 + (bw+8)*2, 16, bw, 36))
+    # d=done / p=progress / n=new plan（⌘付きでも）。方針転換は続けて細分タスク編集が開く
+    win.key_codes = {"d": _BTN1, "p": _BTN2, "n": _BTN3}
+    if parallel_check is not None:
+        win.key_codes["b"] = _BTN_TOGGLE_PARALLEL   # b（both）で並行タスク完了の切替
     _show(win)
     try:
-        resp = NSApp.runModalForWindow_(win)
+        while True:
+            resp = NSApp.runModalForWindow_(win)
+            if resp == _BTN_TOGGLE_PARALLEL and parallel_check is not None:
+                parallel_check.setState_(0 if parallel_check.state() else 1)   # p キーで並行タスクの完了を切替
+                continue
+            break
         parallel_done = bool(parallel_check and parallel_check.state() == 1)
         result = {_BTN1: "complete", _BTN2: "progress", _BTN3: "replan"}.get(resp, "progress")
         return result, parallel_done
@@ -2536,6 +2751,10 @@ class ProgressChecker(rumps.App):
         self._check_week_change()
 
         self._update_lab_reminder_timer()
+        # 外部から「今すぐチェックイン」を叩く受け口（checkin-now.sh / Raycast などから）
+        _dnc = NSDistributedNotificationCenter.defaultCenter()
+        _dnc.addObserver_selector_name_object_(self, "onExternalCheckin:", CHECKIN_NOTIFICATION, None)
+        _dnc.addObserver_selector_name_object_(self, "onExternalEditToday:", EDIT_TODAY_NOTIFICATION, None)
         if not self.data["goals"].get("short"):
             rumps.Timer(self._first_run, 1).start()
         else:
@@ -3091,6 +3310,14 @@ class ProgressChecker(rumps.App):
                 notify("💪 前進中！", current, "少しでも動けたことが大切！")
             elif result == "replan":
                 notify("🔄 賢い判断！", "難しすぎたのかも", "もっと小さなタスクに分けてみよう 💡")
+                # 方針転換 → そのまま細分タスク編集で組み直す（決定するとチェックイン画面へ）
+                current_items = _normalize_today(self.data["goals"].get("today", []))
+                val = show_today_task_editor("方針転換：細分タスクを組み直す", current_items)
+                if val is not None:
+                    kept, deferred = val
+                    self.data["goals"]["today"] = kept
+                    self._merge_deferred(deferred)
+                    self._save()
 
             if parallel_done:
                 parallel = self.data.get("parallel_task", "")
@@ -3306,6 +3533,37 @@ class ProgressChecker(rumps.App):
 
     def _cmd_checkin(self, _):
         self._do_checkin()
+
+    def onExternalCheckin_(self, notif):
+        """NSDistributedNotificationCenter 経由（trigger.sh checkin）。メニューの「今すぐチェックイン」と同じ。
+        ダイアログ表示中に届いた通知は閉じた後にまとめて配送されるので、古いものは捨てる。"""
+        if not _is_fresh_trigger(notif.userInfo()):
+            return
+        if self._checkin_active:
+            _front = _checkin_win_ref[0] or NSApp.modalWindow()
+            if _front is not None:
+                NSApp.activateIgnoringOtherApps_(True)
+                _front.makeKeyAndOrderFront_(None)
+            return
+        NSApp.activateIgnoringOtherApps_(True)
+        self._do_checkin()
+
+    def onExternalEditToday_(self, notif):
+        """trigger.sh edit-today。チェックイン画面が開いていれば「📝 細分タスク編集」ボタンと同じ、
+        何も開いていなければメニューの「今日の目標を変更」と同じ。"""
+        if not _is_fresh_trigger(notif.userInfo()):
+            return
+        NSApp.activateIgnoringOtherApps_(True)
+        _checkin_win = _checkin_win_ref[0]
+        if _checkin_win is not None and NSApp.modalWindow() is _checkin_win:
+            NSApp.stopModalWithCode_(_BTN3)
+            return
+        if self._checkin_active:
+            _front = NSApp.modalWindow()
+            if _front is not None:
+                _front.makeKeyAndOrderFront_(None)
+            return
+        self._edit_today()
 
     def _cmd_edit_interval(self, _):
         if self._checkin_active:
