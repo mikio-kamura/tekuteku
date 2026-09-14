@@ -1510,9 +1510,11 @@ def show_checkin(
     current_interval: int = DEFAULT_INTERVAL,
     active_tries: Optional[list] = None,
     weekly_tries: Optional[list] = None,
+    in_break: bool = False,
 ) -> tuple[str, Optional[str], Optional[str], Optional[str], Optional[int], list]:
     """Returns (action, next_task, parallel_task, message, session_minutes, updated_today_items).
-    action is one of: start, break, edit_today, edit_weekly, edit_short, edit_mid, edit_long."""
+    action is one of: start, break, idle, edit_today, edit_weekly, edit_short, edit_mid, edit_long.
+    idle = ✕で閉じた（セッションも休憩も無しで待機）。in_break: 休憩中からの呼び出し（ボタン表記だけ変わる）。"""
     active_tries = active_tries or []
     weekly_tries = weekly_tries or []
     today_items = _normalize_today(goals.get("today", []))
@@ -1737,7 +1739,8 @@ def show_checkin(
 
     # ── ボタン ──────────────────────────────────────────────────────────────
     _btn(cv, "スタート！",                _BTN1, NSMakeRect(W - 160, 8, 140, 28), primary=True)
-    _btn(cv, f"☕  {BREAK_MINUTES}分休憩", _BTN2, NSMakeRect(W - 312, 8, 140, 28))
+    _break_label = f"☕  さらに{BREAK_MINUTES}分休憩" if in_break else f"☕  {BREAK_MINUTES}分休憩"
+    _btn(cv, _break_label, _BTN2, NSMakeRect(W - 312, 8, 140, 28))
     _btn(cv, "📝 細分タスク編集 (Esc)",    _BTN3, NSMakeRect(X + 20, 8, 150, 28))
     win.key_codes = {"\x1b": _BTN3}   # Esc → 細分タスク編集（ボタンと同じ）
 
@@ -1756,7 +1759,10 @@ def show_checkin(
                 for item in today_model.items
                 if (item.get("text") or "").strip()
             ])
-            if resp in (_CANCEL, _BTN2):
+            if resp == _CANCEL:
+                # ✕で閉じた＝休憩でもセッションでもなく待機。以前は休憩扱いで5分ごとに戻ってきて抜けられなかった
+                return "idle", None, None, None, None, updated_today
+            if resp == _BTN2:
                 return "break", None, None, None, None, updated_today
             if resp == _BTN3:
                 return "edit_today", None, None, None, None, updated_today
@@ -2708,12 +2714,13 @@ class ProgressChecker(rumps.App):
         self._message_item = rumps.MenuItem("💬 コメント: 未設定", callback=None)
         self._next_item = rumps.MenuItem("🔀 並行: ―", callback=None)
         self._pin_item = rumps.MenuItem("📌 サムをピン留め", callback=self._cmd_toggle_pin)
+        self._checkin_item = rumps.MenuItem("🔄 今すぐチェックイン", callback=self._cmd_checkin)
         self.menu = [
             self._task_item,
             self._next_item,
             self._message_item,
             None,
-            rumps.MenuItem("🔄 今すぐチェックイン",    callback=self._cmd_checkin),
+            self._checkin_item,
             rumps.MenuItem("⏱ セッション時間を変更",  callback=self._cmd_edit_interval),
             self._pin_item,
             rumps.MenuItem("✉️ サムのメッセージを編集", callback=self._cmd_edit_sam_messages),
@@ -2834,6 +2841,8 @@ class ProgressChecker(rumps.App):
         self._task_item.title = f"📌 今: {_truncate8(task)}"
         self._next_item.title = f"🔀 並行: {_truncate8(parallel)}" if parallel else "🔀 並行: ―"
         self._message_item.title = f"💬 コメント: {_truncate10(msg)}"
+        # 休憩中はチェックイン項目を「休憩を終える」に読み替える（同じ動作。抜け方が分かるように）
+        self._checkin_item.title = "☕ 休憩を終えてチェックイン" if self._break_mode else "🔄 今すぐチェックイン"
         self._update_countdown()
         sam_msg = self.data.get("sam_message") or "—"
         if self._pin_win is not None and self._pin_msg_label is not None:
@@ -3052,18 +3061,19 @@ class ProgressChecker(rumps.App):
             return
 
         # Step 1: weekly retrospective of last week
-        self._begin_activity_session(self._week_goal_task_name())
+        today_str = self.data.get("today_date", datetime.now().strftime("%Y-%m-%d"))
+        try:
+            today_dt = datetime.strptime(today_str, "%Y-%m-%d")
+        except ValueError:
+            today_dt = datetime.now()
+        this_monday = _monday_of(today_dt)
+        last_monday = this_monday - timedelta(days=7)
+        last_week_start = last_monday.strftime("%Y-%m-%d")
+        last_week_end = (last_monday + timedelta(days=6)).strftime("%Y-%m-%d")
+        _review_task = self._week_review_task_name(last_week_start)
+        self._begin_activity_session(_review_task)
         self._checkin_active = True
         try:
-            today_str = self.data.get("today_date", datetime.now().strftime("%Y-%m-%d"))
-            try:
-                today_dt = datetime.strptime(today_str, "%Y-%m-%d")
-            except ValueError:
-                today_dt = datetime.now()
-            this_monday = _monday_of(today_dt)
-            last_monday = this_monday - timedelta(days=7)
-            last_week_start = last_monday.strftime("%Y-%m-%d")
-            last_week_end = (last_monday + timedelta(days=6)).strftime("%Y-%m-%d")
 
             history = self.data.get("history", [])
             last_week_entries = sorted(
@@ -3092,6 +3102,7 @@ class ProgressChecker(rumps.App):
                 selected = show_try_selector(result.get("try", []))
                 self.data["active_tries"] = selected
                 self._save()
+                self._finish_activity_session(_review_task)
         finally:
             self._checkin_active = False
 
@@ -3217,15 +3228,64 @@ class ProgressChecker(rumps.App):
         finally:
             self._checkin_active = False
 
+    def _go_idle(self):
+        """セッションも休憩も無しの待機状態にする（メニューバーは 🎯 だけ）。
+        次のチェックインは自分で「今すぐチェックイン」を押すまで来ない。"""
+        self._break_mode = False
+        self.data["current_task"] = ""
+        self.data["parallel_task"] = ""
+        self.data["current_message"] = ""
+        self._timer.stop()
+        self._next_checkin_at = datetime.now() + timedelta(days=365)
+        self._save()
+        self._refresh_ui()
+
+    def _ensure_today_task(self, text: str) -> None:
+        """今日の細分タスクに text が無ければ末尾に足す（KPT・週の目標などの活動用）。"""
+        items = _normalize_today(self.data["goals"].get("today", []))
+        if any(t["text"] == text for t in items):
+            return
+        items.append({"text": text, "done": False, "level": 0})
+        self.data["goals"]["today"] = _normalize_levels(items)
+
+    def _mark_today_done(self, text: str) -> bool:
+        """今日の細分タスクのうち text と同名のものにチェックを付ける。付けたら True。"""
+        items = _normalize_today(self.data["goals"].get("today", []))
+        hit = False
+        for t in items:
+            if t["text"] == text and not t.get("done"):
+                t["done"] = True
+                hit = True
+        if hit:
+            self.data["goals"]["today"] = items
+        return hit
+
     def _begin_activity_session(self, task_name: str):
         """Count a reflection/planning activity (KPT, weekly goals) as the
-        current task, running one countdown of the default session length."""
+        current task, running one countdown of the default session length.
+        同名の細分タスクも自動で足す（記録が終わったら _finish_activity_session でチェック）。"""
         self._break_mode = False
         self.data["current_task"] = task_name
         self.data["current_message"] = ""
+        self._ensure_today_task(task_name)
         self._save()
         self._reset_timer()
         self._refresh_ui()
+
+    def _finish_activity_session(self, task_name: str):
+        """活動（KPT・週の計画）を保存したら細分タスクにチェックを付ける。
+        セッション自体は続く（時間が来たら通常のチェックインで次を選ぶ）。"""
+        if self._mark_today_done(task_name):
+            self._save()
+            self._refresh_ui()
+
+    def _week_review_task_name(self, last_week_start: str) -> str:
+        try:
+            mon = datetime.strptime(last_week_start, "%Y-%m-%d")
+        except ValueError:
+            return "先週の振り返り（週次KPT）"
+        sun = mon + timedelta(days=6)
+        return f"{mon.month}/{mon.day}〜{sun.month}/{sun.day}週の振り返り（週次KPT）"
 
     def _week_goal_task_name(self) -> str:
         today_str = self.data.get("today_date", datetime.now().strftime("%Y-%m-%d"))
@@ -3280,11 +3340,16 @@ class ProgressChecker(rumps.App):
         if NSRunLoop.currentRunLoop().currentMode() == NSEventTrackingRunLoopMode:
             return
         was_active = self._checkin_active
+        outer = NSApp.modalWindow()  # 割り込む前に開いていた画面（週の計画・KPTなど）
         self._checkin_active = True
         try:
             self._do_checkin_inner()
         finally:
             self._checkin_active = was_active
+            # 割り込んだダイアログは閉じるときに _hide()（アクセサリ化）するので、
+            # 元の画面が他アプリの後ろに残る。前面に戻してモーダルを続けられるようにする
+            if outer is not None and NSApp.modalWindow() is outer:
+                _show(outer)
 
     def _checkin_feedback(self):
         current = self.data.get("current_task", "")
@@ -3352,6 +3417,7 @@ class ProgressChecker(rumps.App):
                     current_interval=self.data.get("interval_minutes", DEFAULT_INTERVAL),
                     active_tries=self.data.get("active_tries", []),
                     weekly_tries=_weekly_tries,
+                    in_break=self._break_mode,
                 )
 
                 # Save checkbox state regardless of which button was pressed
@@ -3391,6 +3457,9 @@ class ProgressChecker(rumps.App):
         finally:
             nudge_timer.invalidate()
 
+        if action == "idle":
+            self._go_idle()
+            return
         if action == "break" or new_task is None:
             self._break_mode = True
             self._reset_timer(override_minutes=BREAK_MINUTES)
@@ -3590,7 +3659,8 @@ class ProgressChecker(rumps.App):
     def _edit_weekly(self):
         if self._checkin_active:
             return
-        self._begin_activity_session(self._week_goal_task_name())
+        _plan_task = self._week_goal_task_name()
+        self._begin_activity_session(_plan_task)
         self._checkin_active = True
         try:
             weekly = _normalize_weekly(self.data["goals"].get("weekly", {}))
@@ -3600,6 +3670,7 @@ class ProgressChecker(rumps.App):
                 weekly["days"] = result["days"]
                 self.data["goals"]["weekly"] = weekly
                 self._save()
+                self._finish_activity_session(_plan_task)
         finally:
             self._checkin_active = False
 
@@ -3664,9 +3735,11 @@ class ProgressChecker(rumps.App):
         """Run the KPT editor starting at date_str, with prev/next day navigation."""
         if self._checkin_active:
             return
+        _kpt_task = None
         try:
             _kpt_dt = datetime.strptime(date_str, "%Y-%m-%d")
-            self._begin_activity_session(f"{_kpt_dt.month}月{_kpt_dt.day}日のKPT")
+            _kpt_task = f"{_kpt_dt.month}月{_kpt_dt.day}日のKPT"
+            self._begin_activity_session(_kpt_task)
         except ValueError:
             pass
         self._checkin_active = True
@@ -3725,6 +3798,8 @@ class ProgressChecker(rumps.App):
                 self._save()
 
                 if action == "save":
+                    if _kpt_task:
+                        self._finish_activity_session(_kpt_task)
                     break
                 elif action == "prev":
                     current = (current_dt - timedelta(days=1)).strftime("%Y-%m-%d")

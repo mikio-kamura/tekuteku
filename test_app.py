@@ -225,3 +225,56 @@ class TriggerFreshnessTests(unittest.TestCase):
         self.assertFalse(app._is_fresh_trigger({"t": 1000.0}, now=1000.0 + app.TRIGGER_MAX_AGE_SEC + 1))
         self.assertTrue(app._is_fresh_trigger(None))
         self.assertTrue(app._is_fresh_trigger({"t": "garbage"}))
+
+
+class _FakeTimer:
+    def __init__(self):
+        self.stopped = False
+
+    def stop(self):
+        self.stopped = True
+
+
+def _bare_app(today):
+    """rumps の初期化を通さずに ProgressChecker のメソッドだけ試すための素体。"""
+    obj = app.ProgressChecker.__new__(app.ProgressChecker)
+    obj.data = {"goals": {"today": list(today)}, "current_task": "", "parallel_task": "", "current_message": ""}
+    obj._break_mode = True
+    obj._timer = _FakeTimer()
+    obj.saved = 0
+    obj._save = lambda: setattr(obj, "saved", obj.saved + 1)
+    obj._refresh_ui = lambda: None
+    obj._reset_timer = lambda override_minutes=None: None
+    return obj
+
+
+class ActivitySessionTaskTests(unittest.TestCase):
+    def test_begin_adds_task_once_and_finish_checks_it(self):
+        obj = _bare_app([{"text": "論文", "done": False, "level": 0}])
+        obj._begin_activity_session("9月14日のKPT")
+        obj._begin_activity_session("9月14日のKPT")  # 2回呼んでも増えない
+        texts = [t["text"] for t in obj.data["goals"]["today"]]
+        self.assertEqual(texts, ["論文", "9月14日のKPT"])
+        self.assertFalse(obj._break_mode)
+        obj._finish_activity_session("9月14日のKPT")
+        self.assertTrue(obj.data["goals"]["today"][1]["done"])
+        self.assertFalse(obj.data["goals"]["today"][0]["done"])
+
+    def test_finish_without_task_is_noop(self):
+        obj = _bare_app([])
+        obj._finish_activity_session("無い")
+        self.assertEqual(obj.saved, 0)
+
+    def test_week_review_task_name(self):
+        obj = _bare_app([])
+        self.assertEqual(obj._week_review_task_name("2026-09-07"), "9/7〜9/13週の振り返り（週次KPT）")
+        self.assertEqual(obj._week_review_task_name("bad"), "先週の振り返り（週次KPT）")
+
+    def test_go_idle_clears_break_and_session(self):
+        obj = _bare_app([])
+        obj.data["current_task"] = "何か"
+        obj._go_idle()
+        self.assertFalse(obj._break_mode)
+        self.assertEqual(obj.data["current_task"], "")
+        self.assertTrue(obj._timer.stopped)
+        self.assertGreater(obj._next_checkin_at, app.datetime.now() + app.timedelta(days=300))
