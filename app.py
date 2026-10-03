@@ -466,6 +466,7 @@ def _text_view(items: List[str], rect) -> tuple:
     tv.setFont_(NSFont.systemFontOfSize_(14))
     tv.setRichText_(False)
     tv.setAutomaticLinkDetectionEnabled_(False)
+    tv.setAllowsUndo_(True)   # ⌘Z / ⇧⌘Z（NSTextView は既定で無効。NSTextField のフィールドエディタは既定で有効）
     tv.setString_("\n".join(items))
     tv.setAutoresizingMask_(2)
     tv.setDelegate_(_tab_tv_delegate)
@@ -979,12 +980,14 @@ class _KeyWindow(NSWindow):
             if _tree_editor_open[0] and char in ("\r", "\x03") and NSApp.modalWindow() is self:
                 NSApp.stopModalWithCode_(_BTN1)   # 細分タスク編集の「決定」
                 return True
-            if (flags & NSEventModifierFlagShift) and char == "z":
+            # Shift 付きだと charactersIgnoringModifiers は大文字（"Z"）になるので小文字に揃える
+            lc = (char or "").lower()
+            if (flags & NSEventModifierFlagShift) and lc == "z":
                 if NSApp.sendAction_to_from_("redo:", None, None):
                     return True
             else:
                 sel = {"c": "copy:", "v": "paste:", "x": "cut:",
-                       "a": "selectAll:", "z": "undo:"}.get(char)
+                       "a": "selectAll:", "z": "undo:"}.get(lc)
                 if sel and NSApp.sendAction_to_from_(sel, None, None):
                     return True
         return objc.super(_KeyWindow, self).performKeyEquivalent_(event)
@@ -2873,14 +2876,16 @@ class ProgressChecker(rumps.App):
                 edit_root.setSubmenu_(edit_menu)
 
             if edit_menu.numberOfItems() == 0:
-                for title, action, key in (
-                    ("Cut", "cut:", "x"),
-                    ("Copy", "copy:", "c"),
-                    ("Paste", "paste:", "v"),
-                    ("Select All", "selectAll:", "a"),
+                for title, action, key, mask in (
+                    ("Undo", "undo:", "z", NSEventModifierFlagCommand),
+                    ("Redo", "redo:", "z", NSEventModifierFlagCommand | NSEventModifierFlagShift),
+                    ("Cut", "cut:", "x", NSEventModifierFlagCommand),
+                    ("Copy", "copy:", "c", NSEventModifierFlagCommand),
+                    ("Paste", "paste:", "v", NSEventModifierFlagCommand),
+                    ("Select All", "selectAll:", "a", NSEventModifierFlagCommand),
                 ):
                     it = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, key)
-                    it.setKeyEquivalentModifierMask_(NSEventModifierFlagCommand)
+                    it.setKeyEquivalentModifierMask_(mask)
                     edit_menu.addItem_(it)
         except Exception:
             pass
