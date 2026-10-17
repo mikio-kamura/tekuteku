@@ -41,6 +41,7 @@ from AppKit import (
     NSEventModifierFlagControl,
     NSEventModifierFlagShift,
     NSEventTrackingRunLoopMode,
+    NSPasteboard,
     NSPasteboardTypeString,
     NSScreen,
     NSScrollView,
@@ -73,6 +74,15 @@ FOCUS_WEEK_KEY = "今週の1つ"          # この項目 ⇄ てくてくの「�
 # 細分タスクの提案コマンド（受信箱に書いて INBOX_NOTIFICATION を送る側）。data["suggest_cmd"] で上書き可
 DEFAULT_SUGGEST_CMD = "/Volumes/ssd_pyoi/Claude-Code/.claude/tools/tekuteku-bridge/suggest_tasks.py"
 SUGGEST_LOG = "/tmp/tekuteku-suggest.log"
+# 手順書（ZOZO向け・Slackに貼る「次回までに何をやるか」）と日報（KPT＋今日やったこと・次やること・困っていること）
+EDIT_PLAN_NOTIFICATION = "jp.tekuteku.edit-plan"         # trigger.sh plan
+SUGGEST_PLAN_NOTIFICATION = "jp.tekuteku.suggest-plan"   # trigger.sh suggest-plan
+COPY_REPORT_NOTIFICATION = "jp.tekuteku.copy-report"     # trigger.sh report
+DEFAULT_SUGGEST_PLAN_CMD = "/Volumes/ssd_pyoi/Claude-Code/.claude/tools/tekuteku-bridge/suggest_plan.py"
+DEFAULT_PLAN_FILE = "/Volumes/ssd_pyoi/Claude-Code/Research/ZOZO/手順書_現行.md"   # 保存のたびに書き出す正本
+PLAN_KEYS = ["goal", "policy", "outputs", "this_week", "next_week", "review"]
+PLAN_LABELS = {"goal": "🎯 目的", "policy": "✏️ 課題・方針", "outputs": "🗒 アウトプット",
+               "this_week": "📅 今週", "next_week": "📅 来週", "review": "🙏 レビューがほしいタイミング"}
 TRIGGER_MAX_AGE_SEC = 3.0  # これより古い通知は捨てる（ダイアログ中に届いた通知は閉じた後にまとめて配送されるため）
 BREAK_MINUTES = 5
 WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
@@ -846,9 +856,119 @@ def _read_inbox(path: str = INBOX_FILE) -> Optional[dict]:
             d = json.load(f)
     except (OSError, ValueError):
         return None
-    if not isinstance(d, dict) or not isinstance(d.get("tasks"), list):
+    if not isinstance(d, dict):
         return None
-    return {"parent": str(d.get("parent") or ""), "tasks": d["tasks"], "note": str(d.get("note") or "")}
+    tasks = d.get("tasks") if isinstance(d.get("tasks"), list) else []
+    plan = d.get("plan") if isinstance(d.get("plan"), dict) else None
+    if not tasks and plan is None:
+        return None
+    return {"parent": str(d.get("parent") or ""), "tasks": tasks, "note": str(d.get("note") or ""), "plan": plan}
+
+
+def _copy_to_clipboard(text: str) -> bool:
+    try:
+        pb = NSPasteboard.generalPasteboard()
+        pb.clearContents()
+        return bool(pb.setString_forType_(text, NSPasteboardTypeString))
+    except Exception:
+        return False
+
+
+_FOCUS_ITEM_RE = re.compile(r"^\s*[-*]\s*\*\*(.+?)\*\*\s*[：:]\s*(.*)$")
+
+
+def _focus_items(body: list[str]) -> tuple[list[tuple[str, str]], list[str]]:
+    """本文行を (項目名, 説明) の一覧と、それ以外の行（※ 🤖 など。そのまま残す）に分ける。"""
+    items, others = [], []
+    for ln in body:
+        m = _FOCUS_ITEM_RE.match(ln)
+        if m:
+            items.append((m.group(1).strip(), m.group(2).strip()))
+        elif ln.strip():
+            others.append(ln)
+    return items, others
+
+
+def _focus_body_from_items(items: list[tuple[str, str]], others: list[str]) -> list[str]:
+    body = [f"- **{n.strip()}**：{d.strip()}" for n, d in items if n.strip() or d.strip()]
+    body = [b.replace("- ****：", "- **（無題）**：") for b in body]
+    return body + list(others)
+
+
+def _report_lines(items: list[dict], done: bool) -> list[str]:
+    """細分タスクのうち末端で done/未完 のものの文面（親の文脈は付けない）。"""
+    out = []
+    for i, t in enumerate(items):
+        if bool(t.get("done")) == done and _is_leaf(items, i):
+            out.append(t["text"])
+    return out
+
+
+def _daily_report_text(date_label: str, kpt: dict, items: list) -> str:
+    """Slack（#prj_zozo）にそのまま貼る日報。本人の投稿の型に合わせる：
+    K/P/T は1行ずつ「・」区切り、今日やったこと・次やること・困っていること は1行1つ。"""
+    items = _normalize_today(items)
+    def line(key):
+        vals = [v for v in (kpt.get(key) or []) if str(v).strip()]
+        return "・".join(str(v).strip() for v in vals) if vals else "（なし）"
+    def bullets(vals):
+        vals = [str(v).strip() for v in vals if str(v).strip()]
+        return "\n".join("・" + v for v in vals) if vals else "・（なし）"
+    done = _report_lines(items, True)
+    todo = _report_lines(items, False)[:8]
+    return (
+        f"K　{line('keep')}\nP　{line('problem')}\nT　{line('try')}\n\n"
+        f"今日やったこと\n{bullets(done)}\n"
+        f"次やること\n{bullets(todo)}\n"
+        f"困っていること\n{bullets(kpt.get('trouble') or [])}\n"
+    ).rstrip("\n") + "\n"
+
+
+def _normalize_plan(d) -> dict:
+    out = {k: "" for k in PLAN_KEYS}
+    out["updated"] = ""
+    if isinstance(d, dict):
+        for k in PLAN_KEYS:
+            v = d.get(k, "")
+            if isinstance(v, list):
+                v = "\n".join(str(x) for x in v)
+            out[k] = str(v or "").strip()
+        out["updated"] = str(d.get("updated") or "")
+    return out
+
+
+def _plan_is_empty(plan: dict) -> bool:
+    return not any((plan or {}).get(k) for k in PLAN_KEYS)
+
+
+def _bullets(text: str) -> str:
+    lines = [l.strip() for l in (text or "").split("\n") if l.strip()]
+    return "\n".join(l if l.startswith(("-", "•", "・", "◦")) else f"- {l}" for l in lines)
+
+
+def _plan_text(plan: dict) -> str:
+    """Slackに貼る手順書。これまでの手順書（🎯目的／✏️課題・方針／🗒アウトプット／📅）と同じ型。"""
+    plan = _normalize_plan(plan)
+    parts = [f":dart:目的：　{plan['goal']}", "", f":pencil2:課題・方針：　{plan['policy']}", "",
+             ":spiral_note_pad:アウトプット：", _bullets(plan["outputs"]) or "- （未記入）", "",
+             ":date:", "今週", _bullets(plan["this_week"]) or "- （未記入）", "",
+             "来週", _bullets(plan["next_week"]) or "- （未記入）", ""]
+    if plan["review"]:
+        parts.append(f"レビューがほしいタイミング：{plan['review']}")
+    return "\n".join(parts).rstrip("\n") + "\n"
+
+
+def _plan_md(plan: dict, stamp: str) -> str:
+    """手順書の正本md（保存のたびに上書き）。"""
+    plan = _normalize_plan(plan)
+    body = [f"# 手順書（現行）", "",
+            f"🤖 てくてくの「🧭 手順書を編集」で書いたものを保存のたびにここへ書き出す（最終更新 {stamp}）。Slackに貼る文は `trigger.sh plan` → 📋 コピー。", ""]
+    for k in PLAN_KEYS:
+        body.append(f"## {PLAN_LABELS[k]}")
+        body.append("")
+        body.append(_bullets(plan[k]) if k in ("outputs", "this_week", "next_week") else (plan[k] or "（未記入）"))
+        body.append("")
+    return "\n".join(body)
 
 
 def _arrival_color(time_str: str):
@@ -1260,6 +1380,153 @@ def show_list_input(title: str, prompt: str, items: List[str]) -> Optional[List[
             return None
         lines = [l.strip() for l in str(tv.string()).split("\n") if l.strip()]
         return lines if lines else None
+    finally:
+        win.orderOut_(None)
+        _hide()
+
+
+def show_focus_editor(items: list[tuple[str, str]], n_others: int = 0) -> Optional[list[tuple[str, str]]]:
+    """「いまの集中」の項目を 項目名｜説明 の行で編集する。末尾に空行を2つ足す。項目名も説明も空の行は消える。"""
+    rows = list(items) + [("", ""), ("", "")]
+    W = 680
+    ROW = 34
+    H = 150 + ROW * len(rows)
+    win = _make_win("いま集中すること", W, H)
+    cv = win.contentView()
+    cv.addSubview_(_label("いま集中すること（Task/いま集中すること.md の「いまの集中」節）",
+                          NSMakeRect(20, H - 34, W - 40, 22), NSFont.boldSystemFontOfSize_(13)))
+    hint = "1行1項目。左が項目名、右が説明。両方空にすると行が消える。先頭の「今週の1つ」はてくてくの週の目標と同期"
+    if n_others:
+        hint += f"（※/🤖 の補足行 {n_others} 本はそのまま残る）"
+    cv.addSubview_(_label(hint, NSMakeRect(20, H - 56, W - 40, 18), NSFont.systemFontOfSize_(11),
+                          color=NSColor.colorWithWhite_alpha_(0.5, 1.0)))
+    cv.addSubview_(_label("項目名", NSMakeRect(20, H - 80, 150, 16), NSFont.boldSystemFontOfSize_(11),
+                          color=NSColor.colorWithWhite_alpha_(0.4, 1.0)))
+    cv.addSubview_(_label("説明", NSMakeRect(180, H - 80, W - 200, 16), NSFont.boldSystemFontOfSize_(11),
+                          color=NSColor.colorWithWhite_alpha_(0.4, 1.0)))
+    fields = []
+    for i, (name, desc) in enumerate(rows):
+        y = H - 90 - ROW * (i + 1)
+        nf = _input_field(NSMakeRect(20, y, 150, 26), NSFont.systemFontOfSize_(13), placeholder="項目名", default=name)
+        df = _input_field(NSMakeRect(180, y, W - 200, 26), NSFont.systemFontOfSize_(13), placeholder="説明", default=desc)
+        cv.addSubview_(nf); cv.addSubview_(df)
+        fields.append((nf, df))
+    flat = [f for pair in fields for f in pair]
+    for i in range(len(flat) - 1):
+        flat[i].setNextKeyView_(flat[i + 1])
+    flat[-1].setNextKeyView_(flat[0])
+    _btn(cv, "決定", _BTN1, NSMakeRect(W - 136, 12, 116, 32), primary=True)
+    win.setInitialFirstResponder_(flat[1] if flat else None)
+    _show(win)
+    try:
+        resp = NSApp.runModalForWindow_(win)
+        if resp == _CANCEL:
+            return None
+        out = []
+        for nf, df in fields:
+            n, d = nf.stringValue().strip(), df.stringValue().strip()
+            if n or d:
+                out.append((n, d))
+        return out
+    finally:
+        win.orderOut_(None)
+        _hide()
+
+
+def show_copy_text(title: str, text: str, hint: str = "") -> None:
+    """文章を見せて「📋 コピー」でクリップボードへ。閉じるまでモーダル。"""
+    W, H = 560, 440
+    win = _make_win(title, W, H)
+    cv = win.contentView()
+    cv.addSubview_(_label(title, NSMakeRect(20, H - 34, W - 40, 22), NSFont.boldSystemFontOfSize_(13)))
+    if hint:
+        cv.addSubview_(_label(hint, NSMakeRect(20, H - 54, W - 40, 16), NSFont.systemFontOfSize_(11),
+                              color=NSColor.colorWithWhite_alpha_(0.5, 1.0)))
+    scroll, tv = _text_view(text.split("\n"), NSMakeRect(20, 56, W - 40, H - 120))
+    tv.setFont_(NSFont.systemFontOfSize_(13))
+    cv.addSubview_(scroll)
+    _btn(cv, "📋 コピーして閉じる", _BTN1, NSMakeRect(W - 196, 12, 176, 32), primary=True)
+    _btn(cv, "閉じる", _BTN2, NSMakeRect(20, 12, 100, 32))
+    _show(win)
+    try:
+        resp = NSApp.runModalForWindow_(win)
+        if resp == _BTN1:
+            if _copy_to_clipboard(str(tv.string())):
+                notify("📋 コピーしました", "Slackに貼ってください", "")
+    finally:
+        win.orderOut_(None)
+        _hide()
+
+
+def show_plan_editor(plan: dict, proposal: Optional[dict] = None) -> Optional[dict]:
+    """手順書（次回までに何をやるか）のフォーム。決定で保存、📋 で Slack用テキストをコピー（閉じない）、
+    🤖 で届いている提案を各欄に流し込む（閉じない）。None はキャンセル。"""
+    plan = _normalize_plan(plan)
+    W, H = 640, 700
+    win = _make_win("手順書（次回までに何をやるか）", W, H)
+    cv = win.contentView()
+    cv.addSubview_(_label("手順書 — Slackの #prj_zozo に貼る「次回までに何をやるか」",
+                          NSMakeRect(20, H - 34, W - 40, 22), NSFont.boldSystemFontOfSize_(13)))
+    cv.addSubview_(_label("ゆっくりやって2週間、バッファ十分に。前回の反省を踏まえて実現可能なラインで。箇条書きの欄は1行1つ",
+                          NSMakeRect(20, H - 54, W - 40, 16), NSFont.systemFontOfSize_(11),
+                          color=NSColor.colorWithWhite_alpha_(0.5, 1.0)))
+    widgets: dict = {}
+    y = H - 64
+    spec = [("goal", 1, 26), ("policy", 0, 64), ("outputs", 0, 78), ("this_week", 0, 110), ("next_week", 0, 96), ("review", 1, 26)]
+    for key, single, h in spec:
+        y -= 18
+        cv.addSubview_(_label(PLAN_LABELS[key], NSMakeRect(20, y, W - 40, 16), NSFont.boldSystemFontOfSize_(12)))
+        y -= h + 4
+        if single:
+            f = _input_field(NSMakeRect(20, y, W - 40, h), NSFont.systemFontOfSize_(13), placeholder="", default=plan[key])
+            cv.addSubview_(f)
+            widgets[key] = ("field", f)
+        else:
+            scroll, tv = _text_view(plan[key].split("\n") if plan[key] else [], NSMakeRect(20, y, W - 40, h))
+            tv.setFont_(NSFont.systemFontOfSize_(13))
+            cv.addSubview_(scroll)
+            widgets[key] = ("text", tv)
+        y -= 6
+    order = [widgets[k][1] for k, _, _ in spec]
+    for i in range(len(order) - 1):
+        order[i].setNextKeyView_(order[i + 1])
+    order[-1].setNextKeyView_(order[0])
+    _btn(cv, "決定（保存）", _BTN1, NSMakeRect(W - 150, 12, 130, 32), primary=True)
+    _btn(cv, "📋 Slack用にコピー", _BTN2, NSMakeRect(W - 320, 12, 160, 32))
+    if proposal and not _plan_is_empty(proposal):
+        _btn(cv, "🤖 提案で置き換え", _BTN3, NSMakeRect(20, 12, 150, 32))
+
+    def current() -> dict:
+        d = {}
+        for key, (kind, w) in widgets.items():
+            d[key] = w.stringValue().strip() if kind == "field" else str(w.string()).strip()
+        return d
+
+    def fill(d: dict):
+        d = _normalize_plan(d)
+        for key, (kind, w) in widgets.items():
+            if kind == "field":
+                w.setStringValue_(d[key])
+            else:
+                w.setString_(d[key])
+
+    win.setInitialFirstResponder_(order[0])
+    _show(win)
+    try:
+        while True:
+            resp = NSApp.runModalForWindow_(win)
+            if resp == _BTN2:
+                if _copy_to_clipboard(_plan_text(current())):
+                    notify("📋 手順書をコピーしました", "Slackに貼ってください", "")
+                _show(win)
+                continue
+            if resp == _BTN3:
+                fill(proposal or {})
+                _show(win)
+                continue
+            if resp == _CANCEL:
+                return None
+            return _normalize_plan(current())
     finally:
         win.orderOut_(None)
         _hide()
@@ -2054,6 +2321,7 @@ def show_history(history: list) -> None:
 def show_kpt_editor(
     keep: list, problem: list, try_: list,
     kpt_history: list = None,
+    trouble: list = None,
     date_label: str = "",
     can_go_next: bool = False,
     goals: dict = None,
@@ -2117,10 +2385,19 @@ def show_kpt_editor(
             subtitle, NSMakeRect(x, 424, col_w, 16),
             NSFont.systemFontOfSize_(11), color=NSColor.colorWithWhite_alpha_(0.5, 1.0),
         ))
-        scroll, tv = _text_view(items, NSMakeRect(x, 52, col_w, 368))
+        scroll, tv = _text_view(items, NSMakeRect(x, 196, col_w, 224))
         tv.setFont_(NSFont.systemFontOfSize_(13))
         cv.addSubview_(scroll)
         text_views.append(tv)
+    # 困っていること（Slackの日報に載せる。KPTと一緒に書く）
+    cv.addSubview_(_label("😵 困っていること", NSMakeRect(20, 172, 200, 18), NSFont.boldSystemFontOfSize_(12)))
+    cv.addSubview_(_label("Slackの日報（KPT・今日やったこと・次やること・困っていること）に載せる。今日やったこと／次やることは細分タスクから自動",
+                          NSMakeRect(170, 172, W - 190, 16), NSFont.systemFontOfSize_(10),
+                          color=NSColor.colorWithWhite_alpha_(0.5, 1.0)))
+    scroll, tv = _text_view(trouble or [], NSMakeRect(20, 52, W - 40, 114))
+    tv.setFont_(NSFont.systemFontOfSize_(13))
+    cv.addSubview_(scroll)
+    text_views.append(tv)
 
     _btn(cv, "決定",    _BTN1, NSMakeRect(W - 136, 12, 116, 32), primary=True)
     _btn(cv, "◀ 前日", _BTN2, NSMakeRect(160,       12, 110, 32))
@@ -2151,7 +2428,8 @@ def show_kpt_editor(
             return None
         def _parse(tv):
             return [l.strip() for l in str(tv.string()).split("\n") if l.strip()]
-        result = {"keep": _parse(text_views[0]), "problem": _parse(text_views[1]), "try": _parse(text_views[2])}
+        result = {"keep": _parse(text_views[0]), "problem": _parse(text_views[1]), "try": _parse(text_views[2]),
+                  "trouble": _parse(text_views[3])}
         if resp == _BTN2:
             return result, "prev"
         if resp == _BTN3:
@@ -2887,6 +3165,10 @@ class ProgressChecker(rumps.App):
             rumps.MenuItem("🤖 細分タスクを提案してもらう", callback=self._cmd_suggest_tasks),
             rumps.MenuItem("🎯 いま集中すること を編集",   callback=self._cmd_edit_focus),
             None,
+            rumps.MenuItem("🧭 手順書を編集（Slack用）",     callback=self._cmd_edit_plan),
+            rumps.MenuItem("🤖 手順書を提案してもらう",      callback=self._cmd_suggest_plan),
+            rumps.MenuItem("📣 今日の日報をコピー（Slack用）", callback=self._cmd_copy_report),
+            None,
             rumps.MenuItem("📜 過去の記録を見る",         callback=self._cmd_show_history),
             rumps.MenuItem("🏢 ラボ到着を記録",            callback=self._cmd_record_lab_arrival),
             rumps.MenuItem("📊 ラボ出席履歴を見る",        callback=self._cmd_show_lab_history),
@@ -2921,6 +3203,9 @@ class ProgressChecker(rumps.App):
         _dnc.addObserver_selector_name_object_(self, "onInboxReload:", INBOX_NOTIFICATION, None)
         _dnc.addObserver_selector_name_object_(self, "onExternalSuggest:", SUGGEST_NOTIFICATION, None)
         _dnc.addObserver_selector_name_object_(self, "onExternalEditFocus:", EDIT_FOCUS_NOTIFICATION, None)
+        _dnc.addObserver_selector_name_object_(self, "onExternalEditPlan:", EDIT_PLAN_NOTIFICATION, None)
+        _dnc.addObserver_selector_name_object_(self, "onExternalSuggestPlan:", SUGGEST_PLAN_NOTIFICATION, None)
+        _dnc.addObserver_selector_name_object_(self, "onExternalCopyReport:", COPY_REPORT_NOTIFICATION, None)
         self._focus_pull()
         self._import_inbox()
         if not self.data["goals"].get("short"):
@@ -2967,6 +3252,10 @@ class ProgressChecker(rumps.App):
                 data.setdefault("suggest_cmd", DEFAULT_SUGGEST_CMD)
                 data.setdefault("auto_suggest", True)
                 data.setdefault("suggested_date", "")
+                data.setdefault("plan", _normalize_plan({}))
+                data.setdefault("plan_proposal", None)
+                data.setdefault("plan_file", DEFAULT_PLAN_FILE)
+                data.setdefault("suggest_plan_cmd", DEFAULT_SUGGEST_PLAN_CMD)
                 return data
             except Exception:
                 pass
@@ -2995,6 +3284,10 @@ class ProgressChecker(rumps.App):
             "suggest_cmd": DEFAULT_SUGGEST_CMD,
             "auto_suggest": True,
             "suggested_date": "",
+            "plan": _normalize_plan({}),
+            "plan_proposal": None,
+            "plan_file": DEFAULT_PLAN_FILE,
+            "suggest_plan_cmd": DEFAULT_SUGGEST_PLAN_CMD,
         }
 
     def _save(self):
@@ -3946,6 +4239,7 @@ class ProgressChecker(rumps.App):
                     existing.get("problem", []),
                     existing.get("try", []),
                     kpt_history=kpt_history,
+                    trouble=existing.get("trouble", []),
                     date_label=date_label,
                     can_go_next=can_go_next,
                     goals=self.data.get("goals", {}),
@@ -3978,6 +4272,12 @@ class ProgressChecker(rumps.App):
                 if action == "save":
                     if _kpt_task:
                         self._finish_activity_session(_kpt_task)
+                    # Slackに貼る日報（KPT＋今日やったこと・次やること・困っていること）
+                    items = self.data["goals"].get("today", []) if current == today_str else \
+                        next((e.get("tasks", []) for e in self.data.get("history", []) if e.get("date") == current), [])
+                    show_copy_text(f"{date_label} の日報（Slack #prj_zozo 用）",
+                                   _daily_report_text(date_label, result, items),
+                                   "北岸さんのリマインド（毎日18:00）への返信用。直してからコピーしてもよい")
                     break
                 elif action == "prev":
                     current = (current_dt - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -4071,13 +4371,11 @@ class ProgressChecker(rumps.App):
             return
         self._checkin_active = True
         try:
-            lines = show_list_input(
-                "いま集中すること（md の正本を直接編集）",
-                "「- **項目名**：説明」の形で1行1項目。先頭の行が今週の1つ",
-                body,
-            )
-            if lines is None:
+            items, others = _focus_items(body)
+            new_items = show_focus_editor(items, n_others=len(others))
+            if new_items is None:
                 return
+            lines = _focus_body_from_items(new_items, others)
             if not _focus_write(path, lines, note="てくてくから「いまの集中」を編集"):
                 notify("🎯 いま集中すること", "書き込めませんでした", path)
                 return
@@ -4119,14 +4417,19 @@ class ProgressChecker(rumps.App):
         if box is None:
             notify("🤖 受信箱", "中身が読めなかったので捨てました", INBOX_FILE)
             return
-        items, n = _merge_inbox(self.data["goals"].get("today", []), box["parent"], box["tasks"])
-        self.data["goals"]["today"] = items
-        self._save()
-        self._refresh_ui()
-        if n:
-            notify("🤖 細分タスクを追加", f"{n}件（{box['parent'] or '直下'}）", box["note"][:80])
-        else:
-            notify("🤖 細分タスク", "追加なし（すべて既にあります）", box["note"][:80])
+        if box.get("plan"):
+            self.data["plan_proposal"] = _normalize_plan(box["plan"])
+            self._save()
+            notify("🤖 手順書の提案が届きました", "「🧭 手順書を編集」→「🤖 提案で置き換え」で読み込めます", box["note"][:80])
+        if box["tasks"]:
+            items, n = _merge_inbox(self.data["goals"].get("today", []), box["parent"], box["tasks"])
+            self.data["goals"]["today"] = items
+            self._save()
+            self._refresh_ui()
+            if n:
+                notify("🤖 細分タスクを追加", f"{n}件（{box['parent'] or '直下'}）", box["note"][:80])
+            else:
+                notify("🤖 細分タスク", "追加なし（すべて既にあります）", box["note"][:80])
 
     def _retry_import_inbox(self, timer: rumps.Timer):
         timer.stop()
@@ -4176,6 +4479,95 @@ class ProgressChecker(rumps.App):
         if not _is_fresh_trigger(notif.userInfo()):
             return
         self._run_suggest("trigger.sh suggest")
+
+    # ── 手順書と日報（Slack用） ──────────────────────────────────────────────
+
+    def _edit_plan(self):
+        if self._checkin_active:
+            return
+        self._checkin_active = True
+        try:
+            result = show_plan_editor(self.data.get("plan") or {}, self.data.get("plan_proposal"))
+            if result is None:
+                return
+            result["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+            self.data["plan"] = result
+            self.data["plan_proposal"] = None
+            self._save()
+            self._write_plan_file(result)
+            notify("🧭 手順書を保存", "Slackに貼るなら「📋 Slack用にコピー」", "")
+        finally:
+            self._checkin_active = False
+
+    def _write_plan_file(self, plan: dict):
+        path = os.path.expanduser(self.data.get("plan_file") or DEFAULT_PLAN_FILE)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(_plan_md(plan, plan.get("updated") or ""))
+        except OSError:
+            notify("🧭 手順書", "mdへの書き出しに失敗", path)
+
+    def _cmd_edit_plan(self, _):
+        self._edit_plan()
+
+    def onExternalEditPlan_(self, notif):
+        if not _is_fresh_trigger(notif.userInfo()):
+            return
+        NSApp.activateIgnoringOtherApps_(True)
+        self._edit_plan()
+
+    def _run_suggest_plan(self, reason: str = "") -> bool:
+        cmd = os.path.expanduser(self.data.get("suggest_plan_cmd") or DEFAULT_SUGGEST_PLAN_CMD)
+        if not os.path.exists(cmd):
+            notify("🤖 手順書の提案", "提案コマンドが見つかりません", cmd)
+            return False
+        try:
+            log = open(SUGGEST_LOG, "a")
+            subprocess.Popen([cmd], start_new_session=True, stdin=subprocess.DEVNULL,
+                             stdout=log, stderr=subprocess.STDOUT)
+        except OSError as e:
+            notify("🤖 手順書の提案", "起動に失敗", str(e)[:80])
+            return False
+        notify("🤖 手順書を考えています", "2〜4分で届きます（Slackのやりとり＋mdを読みます）", reason)
+        return True
+
+    def _cmd_suggest_plan(self, _):
+        self._run_suggest_plan("メニューから")
+
+    def onExternalSuggestPlan_(self, notif):
+        if not _is_fresh_trigger(notif.userInfo()):
+            return
+        self._run_suggest_plan("trigger.sh suggest-plan")
+
+    def _copy_report(self):
+        if self._checkin_active:
+            return
+        today_str = self.data.get("today_date", datetime.now().strftime("%Y-%m-%d"))
+        kpt = self.data.get("kpt") or {}
+        if kpt.get("date") != today_str:
+            kpt = next((e for e in self.data.get("kpt_history", []) if e.get("date") == today_str), {})
+        try:
+            d = datetime.strptime(today_str, "%Y-%m-%d")
+            label = f"{d.month}/{d.day}"
+        except ValueError:
+            label = today_str
+        self._checkin_active = True
+        try:
+            show_copy_text(f"{label} の日報（Slack #prj_zozo 用）",
+                           _daily_report_text(label, kpt, self.data["goals"].get("today", [])),
+                           "KPTが空なら「📝 今日の振り返り（KPT）」を先に。直してからコピーしてもよい")
+        finally:
+            self._checkin_active = False
+
+    def _cmd_copy_report(self, _):
+        self._copy_report()
+
+    def onExternalCopyReport_(self, notif):
+        if not _is_fresh_trigger(notif.userInfo()):
+            return
+        NSApp.activateIgnoringOtherApps_(True)
+        self._copy_report()
 
     # ── Lab arrival tracking ──────────────────────────────────────────────
 

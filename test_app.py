@@ -342,3 +342,45 @@ class InboxMergeTests(unittest.TestCase):
             self.assertIsNone(app._read_inbox(f.name))
         finally:
             os.remove(f.name)
+
+
+class FocusItemsTests(unittest.TestCase):
+    def test_items_and_others_roundtrip(self):
+        body = ["- **今週の1つ**：A", "※ 補足", "- **決めごと**：B", "🤖 メモ"]
+        items, others = app._focus_items(body)
+        self.assertEqual(items, [("今週の1つ", "A"), ("決めごと", "B")])
+        self.assertEqual(others, ["※ 補足", "🤖 メモ"])
+        self.assertEqual(app._focus_body_from_items(items + [("", ""), ("新", "C")], others),
+                         ["- **今週の1つ**：A", "- **決めごと**：B", "- **新**：C", "※ 補足", "🤖 メモ"])
+
+
+class ReportAndPlanTests(unittest.TestCase):
+    def test_daily_report_format(self):
+        kpt = {"keep": ["ラボに来た", "振り返り"], "problem": ["時が流れる"], "try": [], "trouble": ["倫理の書き方"]}
+        items = [{"text": "親", "done": False, "level": 0}, {"text": "子完了", "done": True, "level": 1},
+                 {"text": "子未完（8分）", "done": False, "level": 1}]
+        txt = app._daily_report_text("10/17", kpt, items)
+        self.assertEqual(txt, "K　ラボに来た・振り返り\nP　時が流れる\nT　（なし）\n\n今日やったこと\n・子完了\n次やること\n・子未完（8分）\n困っていること\n・倫理の書き方\n")
+
+    def test_plan_text_and_normalize(self):
+        plan = app._normalize_plan({"goal": "通す", "outputs": ["原稿", "- 図"], "this_week": "a\nb", "review": "10/20"})
+        self.assertEqual(plan["outputs"], "原稿\n- 図")
+        txt = app._plan_text(plan)
+        self.assertTrue(txt.startswith(":dart:目的：　通す\n"))
+        self.assertIn(":spiral_note_pad:アウトプット：\n- 原稿\n- 図\n", txt)
+        self.assertIn("今週\n- a\n- b\n", txt)
+        self.assertIn("来週\n- （未記入）", txt)
+        self.assertTrue(txt.rstrip().endswith("レビューがほしいタイミング：10/20"))
+        self.assertTrue(app._plan_is_empty(app._normalize_plan({})))
+        self.assertIn("## 🎯 目的\n\n通す", app._plan_md(plan, "2026-10-17 23:00"))
+
+    def test_inbox_with_plan_only(self):
+        import tempfile, os, json
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"plan": {"goal": "x"}}, f)
+        try:
+            box = app._read_inbox(f.name)
+            self.assertEqual(box["tasks"], [])
+            self.assertEqual(box["plan"]["goal"], "x")
+        finally:
+            os.remove(f.name)
