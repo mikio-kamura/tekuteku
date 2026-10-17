@@ -78,6 +78,7 @@ SUGGEST_LOG = "/tmp/tekuteku-suggest.log"
 EDIT_PLAN_NOTIFICATION = "jp.tekuteku.edit-plan"         # trigger.sh plan
 SUGGEST_PLAN_NOTIFICATION = "jp.tekuteku.suggest-plan"   # trigger.sh suggest-plan
 COPY_REPORT_NOTIFICATION = "jp.tekuteku.copy-report"     # trigger.sh report
+EDIT_KPT_NOTIFICATION = "jp.tekuteku.edit-kpt"           # trigger.sh kpt（日報＝KPT画面を開く）
 DEFAULT_SUGGEST_PLAN_CMD = "/Volumes/ssd_pyoi/Claude-Code/.claude/tools/tekuteku-bridge/suggest_plan.py"
 DEFAULT_PLAN_FILE = "/Volumes/ssd_pyoi/Claude-Code/Research/ZOZO/手順書_現行.md"   # 保存のたびに書き出す正本
 PLAN_KEYS = ["goal", "policy", "outputs", "this_week", "next_week", "review"]
@@ -904,24 +905,17 @@ def _report_lines(items: list[dict], done: bool) -> list[str]:
     return out
 
 
-def _daily_report_text(date_label: str, kpt: dict, items: list) -> str:
-    """Slack（#prj_zozo）にそのまま貼る日報。本人の投稿の型に合わせる：
-    K/P/T は1行ずつ「・」区切り、今日やったこと・次やること・困っていること は1行1つ。"""
-    items = _normalize_today(items)
+def _daily_report_text(kpt: dict) -> str:
+    """Slack（#prj_zozo）にそのまま貼る日報。本人がKPT画面に書いたものだけを使う（自動生成はしない）。
+    型は本人の投稿に合わせる：K/P/T は1行ずつ、各欄の項目は「・」でつなぐ。"""
     def line(key):
-        vals = [v for v in (kpt.get(key) or []) if str(v).strip()]
-        return "・".join(str(v).strip() for v in vals) if vals else "（なし）"
-    def bullets(vals):
-        vals = [str(v).strip() for v in vals if str(v).strip()]
-        return "\n".join("・" + v for v in vals) if vals else "・（なし）"
-    done = _report_lines(items, True)
-    todo = _report_lines(items, False)[:8]
-    return (
-        f"K　{line('keep')}\nP　{line('problem')}\nT　{line('try')}\n\n"
-        f"今日やったこと\n{bullets(done)}\n"
-        f"次やること\n{bullets(todo)}\n"
-        f"困っていること\n{bullets(kpt.get('trouble') or [])}\n"
-    ).rstrip("\n") + "\n"
+        vals = [str(v).strip() for v in (kpt.get(key) or []) if str(v).strip()]
+        return "・".join(vals)
+    parts = [f"K　{line('keep')}", f"P　{line('problem')}", f"T　{line('try')}", ""]
+    for title, key in (("今日やったこと", "did"), ("次やること", "next"), ("困っていること", "trouble")):
+        parts.append(title)
+        parts.append(line(key))
+    return "\n".join(parts).rstrip("\n") + "\n"
 
 
 def _normalize_plan(d) -> dict:
@@ -2393,7 +2387,8 @@ def show_kpt_editor(
     keep: list, problem: list, try_: list,
     kpt_history: list = None,
     trouble: list = None,
-    report_items: list = None,
+    did: list = None,
+    next_: list = None,
     date_label: str = "",
     can_go_next: bool = False,
     goals: dict = None,
@@ -2459,19 +2454,18 @@ def show_kpt_editor(
             subtitle, NSMakeRect(x, 424, col_w, 16),
             NSFont.systemFontOfSize_(11), color=NSColor.colorWithWhite_alpha_(0.5, 1.0),
         ))
-        scroll, tv = _text_view(items, NSMakeRect(x, 196, col_w, 224))
+        scroll, tv = _text_view(items, NSMakeRect(x, 214, col_w, 206))
         tv.setFont_(NSFont.systemFontOfSize_(13))
         cv.addSubview_(scroll)
         text_views.append(tv)
-    # 困っていること（Slackの日報に載せる。KPTと一緒に書く）
-    cv.addSubview_(_label("😵 困っていること", NSMakeRect(20, 172, 200, 18), NSFont.boldSystemFontOfSize_(12)))
-    cv.addSubview_(_label("Slackの日報（KPT・今日やったこと・次やること・困っていること）に載せる。今日やったこと／次やることは細分タスクから自動",
-                          NSMakeRect(170, 172, W - 190, 16), NSFont.systemFontOfSize_(10),
-                          color=NSColor.colorWithWhite_alpha_(0.5, 1.0)))
-    scroll, tv = _text_view(trouble or [], NSMakeRect(20, 52, W - 40, 114))
-    tv.setFont_(NSFont.systemFontOfSize_(13))
-    cv.addSubview_(scroll)
-    text_views.append(tv)
+    # 日報の残り3欄（Slackの #prj_zozo に貼る「今日やったこと・次やること・困っていること」）。書いたものをそのままコピーする
+    for idx, (title, items) in enumerate([("📝 今日やったこと", did), ("➡️ 次やること", next_), ("😵 困っていること", trouble)]):
+        x = 20 + idx * (col_w + 10)
+        cv.addSubview_(_label(title, NSMakeRect(x, 188, col_w, 18), NSFont.boldSystemFontOfSize_(12)))
+        scroll, tv = _text_view(items or [], NSMakeRect(x, 52, col_w, 132))
+        tv.setFont_(NSFont.systemFontOfSize_(13))
+        cv.addSubview_(scroll)
+        text_views.append(tv)
 
     _btn(cv, "決定",    _BTN1, NSMakeRect(W - 136, 12, 116, 32), primary=True)
     _btn(cv, "◀ 前日", _BTN2, NSMakeRect(160,       12, 110, 32))
@@ -2492,6 +2486,10 @@ def show_kpt_editor(
     def _parse(tv):
         return [l.strip() for l in str(tv.string()).split("\n") if l.strip()]
 
+    def _collect() -> dict:
+        return {"keep": _parse(text_views[0]), "problem": _parse(text_views[1]), "try": _parse(text_views[2]),
+                "did": _parse(text_views[3]), "next": _parse(text_views[4]), "trouble": _parse(text_views[5])}
+
     _show(win)
     try:
         while True:
@@ -2502,9 +2500,7 @@ def show_kpt_editor(
                 _show(win)  # bring this window back to front and continue
                 continue
             if resp == _BTN4:
-                _kpt_now = {"keep": _parse(text_views[0]), "problem": _parse(text_views[1]),
-                            "try": _parse(text_views[2]), "trouble": _parse(text_views[3])}
-                if _copy_to_clipboard(_daily_report_text(date_label, _kpt_now, report_items or [])):
+                if _copy_to_clipboard(_daily_report_text(_collect())):
                     notify("📋 日報をコピーしました", "Slackの #prj_zozo に貼ってください", "")
                 else:
                     notify("📋 日報", "コピーに失敗しました", "")
@@ -2513,8 +2509,7 @@ def show_kpt_editor(
             break
         if resp == _CANCEL:
             return None
-        result = {"keep": _parse(text_views[0]), "problem": _parse(text_views[1]), "try": _parse(text_views[2]),
-                  "trouble": _parse(text_views[3])}
+        result = _collect()
         if resp == _BTN2:
             return result, "prev"
         if resp == _BTN3:
@@ -3291,6 +3286,7 @@ class ProgressChecker(rumps.App):
         _dnc.addObserver_selector_name_object_(self, "onExternalEditPlan:", EDIT_PLAN_NOTIFICATION, None)
         _dnc.addObserver_selector_name_object_(self, "onExternalSuggestPlan:", SUGGEST_PLAN_NOTIFICATION, None)
         _dnc.addObserver_selector_name_object_(self, "onExternalCopyReport:", COPY_REPORT_NOTIFICATION, None)
+        _dnc.addObserver_selector_name_object_(self, "onExternalEditKpt:", EDIT_KPT_NOTIFICATION, None)
         self._focus_pull()
         self._import_inbox()
         if not self.data["goals"].get("short"):
@@ -4325,8 +4321,8 @@ class ProgressChecker(rumps.App):
                     existing.get("try", []),
                     kpt_history=kpt_history,
                     trouble=existing.get("trouble", []),
-                    report_items=(self.data["goals"].get("today", []) if current == today_str else
-                                  next((e.get("tasks", []) for e in self.data.get("history", []) if e.get("date") == current), [])),
+                    did=existing.get("did", []),
+                    next_=existing.get("next", []),
                     date_label=date_label,
                     can_go_next=can_go_next,
                     goals=self.data.get("goals", {}),
@@ -4359,12 +4355,6 @@ class ProgressChecker(rumps.App):
                 if action == "save":
                     if _kpt_task:
                         self._finish_activity_session(_kpt_task)
-                    # Slackに貼る日報（KPT＋今日やったこと・次やること・困っていること）
-                    items = self.data["goals"].get("today", []) if current == today_str else \
-                        next((e.get("tasks", []) for e in self.data.get("history", []) if e.get("date") == current), [])
-                    show_copy_text(f"{date_label} の日報（Slack #prj_zozo 用）",
-                                   _daily_report_text(date_label, result, items),
-                                   "北岸さんのリマインド（毎日18:00）への返信用。直してからコピーしてもよい")
                     break
                 elif action == "prev":
                     current = (current_dt - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -4664,7 +4654,7 @@ class ProgressChecker(rumps.App):
             label = f"{d.month}/{d.day}"
         except ValueError:
             label = today_str
-        return label, _daily_report_text(label, kpt, self.data["goals"].get("today", []))
+        return label, _daily_report_text(kpt)
 
     def _copy_report_direct(self):
         """画面を出さずにクリップボードへ。ダイアログ表示中でも動く（trigger.sh report／Raycast 用）。"""
@@ -4689,14 +4679,25 @@ class ProgressChecker(rumps.App):
             label = today_str
         self._checkin_active = True
         try:
-            show_copy_text(f"{label} の日報（Slack #prj_zozo 用）",
-                           _daily_report_text(label, kpt, self.data["goals"].get("today", [])),
-                           "KPTが空なら「📝 今日の振り返り（KPT）」を先に。直してからコピーしてもよい")
+            show_copy_text(f"{label} の日報（Slack #prj_zozo 用）", _daily_report_text(kpt),
+                           "KPT画面に書いたものをそのまま出している。空なら「📝 今日の振り返り（KPT）」で書く")
         finally:
             self._checkin_active = False
 
     def _cmd_copy_report(self, _):
         self._copy_report()
+
+    def onExternalEditKpt_(self, notif):
+        """trigger.sh kpt。今日の日報（KPT画面）を開く。別のダイアログが開いていればそれを前に出すだけ。"""
+        if not _is_fresh_trigger(notif.userInfo()):
+            return
+        NSApp.activateIgnoringOtherApps_(True)
+        if self._checkin_active:
+            _front = NSApp.modalWindow()
+            if _front is not None:
+                _front.makeKeyAndOrderFront_(None)
+            return
+        self._do_retrospective_for(self.data.get("today_date", datetime.now().strftime("%Y-%m-%d")))
 
     def onExternalCopyReport_(self, notif):
         if not _is_fresh_trigger(notif.userInfo()):

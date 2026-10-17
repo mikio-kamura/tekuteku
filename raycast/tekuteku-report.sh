@@ -12,7 +12,7 @@
 # @raycast.packageName てくてく
 
 # Documentation:
-# @raycast.description 今日のKPT・今日やったこと・次やること・困っていることをSlack用にコピーする
+# @raycast.description KPT画面に書いた今日の日報を、そのままSlackに貼れる形でクリップボードへ
 # @raycast.author mikio_kamura
 
 "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/trigger.sh" report

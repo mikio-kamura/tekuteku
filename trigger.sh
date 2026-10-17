@@ -7,7 +7,8 @@
 #   trigger.sh reload-inbox 受信箱 ~/.tekuteku.inbox.json を取り込ませる（suggest_tasks.py が使う）
 #   trigger.sh plan         手順書（Slackに貼る「次回までに何をやるか」）を編集する
 #   trigger.sh suggest-plan Claude に手順書を提案させる（Slackのやりとり＋mdを読む。受信箱経由で届く）
-#   trigger.sh report       今日の日報（KPT・今日やったこと・次やること・困っていること）をSlack用にコピーする
+#   trigger.sh report       今日の日報（KPT画面に書いたもの）をSlack用にそのままクリップボードへ
+#   trigger.sh kpt          今日の日報（KPT画面）を開く
 # 送信時刻を添えるので、ダイアログ表示中に押した分は（閉じた後に配送されても）捨てられる。
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="$DIR/.venv/bin/python"
@@ -21,7 +22,8 @@ case "${1:-checkin}" in
   plan)         NAME="jp.tekuteku.edit-plan" ;;
   suggest-plan) NAME="jp.tekuteku.suggest-plan" ;;
   report)       NAME="jp.tekuteku.copy-report" ;;
-  *) echo "usage: trigger.sh checkin|edit-today|suggest|focus|reload-inbox|plan|suggest-plan|report" >&2; exit 2 ;;
+  kpt)          NAME="jp.tekuteku.edit-kpt" ;;
+  *) echo "usage: trigger.sh checkin|edit-today|suggest|focus|reload-inbox|plan|suggest-plan|report|kpt" >&2; exit 2 ;;
 esac
 exec "$PY" - "$NAME" <<'PYEOF'
 import sys, time

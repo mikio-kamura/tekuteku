@@ -355,12 +355,11 @@ class FocusItemsTests(unittest.TestCase):
 
 
 class ReportAndPlanTests(unittest.TestCase):
-    def test_daily_report_format(self):
-        kpt = {"keep": ["ラボに来た", "振り返り"], "problem": ["時が流れる"], "try": [], "trouble": ["倫理の書き方"]}
-        items = [{"text": "親", "done": False, "level": 0}, {"text": "子完了", "done": True, "level": 1},
-                 {"text": "子未完（8分）", "done": False, "level": 1}]
-        txt = app._daily_report_text("10/17", kpt, items)
-        self.assertEqual(txt, "K　ラボに来た・振り返り\nP　時が流れる\nT　（なし）\n\n今日やったこと\n・子完了\n次やること\n・子未完（8分）\n困っていること\n・倫理の書き方\n")
+    def test_daily_report_is_exactly_what_user_wrote(self):
+        kpt = {"keep": ["ラボに来た", "振り返り"], "problem": ["時が流れる"], "try": [],
+               "did": ["謝金手続き"], "next": ["手順書", "論文を読む"], "trouble": []}
+        self.assertEqual(app._daily_report_text(kpt),
+                         "K　ラボに来た・振り返り\nP　時が流れる\nT　\n\n今日やったこと\n謝金手続き\n次やること\n手順書・論文を読む\n困っていること\n")
 
     def test_plan_text_and_normalize(self):
         plan = app._normalize_plan({"goal": "通す", "outputs": ["原稿", "- 図"], "this_week": "a\nb", "review": "10/20"})
