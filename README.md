@@ -19,9 +19,9 @@ macOS のメニューバーに常駐する、定期チェックイン型の進�
 - **記録の閲覧** — 過去のチェックイン履歴をいつでも振り返れる
 - **いま集中すること（md）と同期** — メニュー「🎯 いま集中すること を編集」で、Claude-Code 側の正本 `Task/いま集中すること.md` の「いまの集中」節を「項目名｜説明」のフォームで編集できるぜ（保存すると md に反映。※/🤖 の補足行は残る）（`focus_file` で場所を変えられる）。「今週の計画」の週の目標を保存すると md の「今週の1つ」に写し、週が変わって週の目標が空のときは md の「今週の1つ」を週の目標に入れるよな
 - **外から細分タスクを受け取る** — `~/.tekuteku.inbox.json` に `{"parent": "親", "tasks": [{"text": "…（8分）"}]}` を置いて `trigger.sh reload-inbox` を送ると、今日の目標に親子で足される（同名は飛ばす、ダイアログ中は閉じてから）。Claude Code からは `tekuteku-add` がこれをやってくれるぜ。メニュー「🤖 細分タスクを提案してもらう」（`trigger.sh suggest`）は `suggest_cmd` のスクリプトを裏で走らせる予備ルート。新しい日に未完了が少なければ1日1回自動で走る（`auto_suggest: false` で止める）
-- **日報を Slack 用にコピー** — KPT 画面に「😵 困っていること」欄がある。保存すると `K　…／P　…／T　…／今日やったこと／次やること／困っていること` の文が出て「📋 コピー」できるぜ（今日やったこと・次やることは細分タスクの完了／未完了から自動）。メニュー「📣 今日の日報をコピー」や `trigger.sh report` でいつでも出せる。自動投稿はしないよな
+- **日報を Slack 用にコピー** — KPT 画面に「今日やったこと」「次やること」「困っていること」の欄がある。あなたが書いたものを、てくてくは `K　…／P　…／T　…／今日やったこと／次やること／困っていること` の形でそのままクリップボードへ入れるぜ（画面右上の「📋 日報をコピー」、メニュー「📣 今日の日報をコピー」、`trigger.sh report`）。自動生成も自動投稿もしないよな。`trigger.sh kpt` で日報の画面が開く
 - **手順書（次回までに何をやるか）** — メニュー「🧭 手順書を編集」のフォーム（🎯目的／✏️課題・方針／🗒アウトプット／📅今週／📅来週／レビュー時期）。「📋 Slack用にコピー」で貼る文が取れる。保存のたびに `plan_file`（既定は Claude-Code の `Research/ZOZO/手順書_現行.md`）を上書きするぜ。「🤖 手順書を提案してもらう」（`suggest_plan_cmd`）で届いた提案は「🤖 提案で置き換え」で各欄に入る。受信箱の `{"plan": {...}}` でも届く
-- **外から操作（Raycast）** — `trigger.sh checkin` で今すぐチェックイン、`trigger.sh edit-today` で細分タスク編集が開くぜ。`trigger.sh suggest` で提案、`trigger.sh focus` でいま集中することの編集、`trigger.sh plan` で手順書、`trigger.sh suggest-plan` で手順書の提案、`trigger.sh report` で日報コピー。Raycast 用のスクリプトコマンドは `raycast/` に6本（チェックイン／細分タスク編集／提案／いま集中すること／手順書／日報）。Raycast の Settings → Extensions → ＋ → Add Script Directory で `raycast/` を追加してホットキーを割り当てる。ダイアログ表示中に押した分は捨てられるので二重に開かないよな
+- **外から操作（Raycast）** — `trigger.sh checkin` で今すぐチェックイン、`trigger.sh edit-today` で細分タスク編集が開くぜ。`trigger.sh suggest` で提案、`trigger.sh focus` でいま集中することの編集、`trigger.sh plan` で手順書、`trigger.sh suggest-plan` で手順書の提案、`trigger.sh report` で日報コピー、`trigger.sh kpt` で日報（KPT）の編集。Raycast 用のスクリプトコマンドは `raycast/` に7本（チェックイン／細分タスク編集／提案／いま集中すること／手順書／日報を編集／日報をコピー）。Raycast の Settings → Extensions → ＋ → Add Script Directory で `raycast/` を追加してホットキーを割り当てる。ダイアログ表示中に押した分は捨てられるので二重に開かないよな
 
 ---
 
