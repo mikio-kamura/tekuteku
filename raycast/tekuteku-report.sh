@@ -15,4 +15,4 @@
 # @raycast.description 今日のKPT・今日やったこと・次やること・困っていることをSlack用にコピーする
 # @raycast.author mikio_kamura
 
-"$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/trigger.sh" focus
+"$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/trigger.sh" report

@@ -1458,11 +1458,32 @@ def show_copy_text(title: str, text: str, hint: str = "") -> None:
         _hide()
 
 
-def show_plan_editor(plan: dict, proposal: Optional[dict] = None) -> Optional[dict]:
+class _PlanPollHandler(NSObject):
+    """手順書フォームを開いたまま、届いた提案を拾う（NSRunLoopCommonModes なのでモーダル中も動く）。"""
+    poll = None       # () -> Optional[dict]
+    on_arrive = None  # (dict) -> None
+
+    def tick_(self, timer):
+        try:
+            if self.poll is None:
+                return
+            d = self.poll()
+            if d and self.on_arrive is not None:
+                self.on_arrive(d)
+        except Exception:
+            pass
+
+
+_plan_poll_handler = _PlanPollHandler.alloc().init()
+
+
+def show_plan_editor(plan: dict, proposal: Optional[dict] = None,
+                     on_suggest=None, poll_proposal=None) -> Optional[dict]:
     """手順書（次回までに何をやるか）のフォーム。決定で保存、📋 で Slack用テキストをコピー（閉じない）、
-    🤖 で届いている提案を各欄に流し込む（閉じない）。None はキャンセル。"""
+    🤖 提案してもらう で裏で提案を作らせ、届いたらこの画面に流し込む（欄が空なら自動、入っていれば「提案で置き換え」）。
+    None はキャンセル。"""
     plan = _normalize_plan(plan)
-    W, H = 640, 700
+    W, H = 640, 720
     win = _make_win("手順書（次回までに何をやるか）", W, H)
     cv = win.contentView()
     cv.addSubview_(_label("手順書 — Slackの #prj_zozo に貼る「次回までに何をやるか」",
@@ -1470,8 +1491,11 @@ def show_plan_editor(plan: dict, proposal: Optional[dict] = None) -> Optional[di
     cv.addSubview_(_label("ゆっくりやって2週間、バッファ十分に。前回の反省を踏まえて実現可能なラインで。箇条書きの欄は1行1つ",
                           NSMakeRect(20, H - 54, W - 40, 16), NSFont.systemFontOfSize_(11),
                           color=NSColor.colorWithWhite_alpha_(0.5, 1.0)))
+    status = _label("", NSMakeRect(20, H - 74, W - 40, 16), NSFont.systemFontOfSize_(11),
+                    color=NSColor.systemBlueColor())
+    cv.addSubview_(status)
     widgets: dict = {}
-    y = H - 64
+    y = H - 84
     spec = [("goal", 1, 26), ("policy", 0, 64), ("outputs", 0, 78), ("this_week", 0, 110), ("next_week", 0, 96), ("review", 1, 26)]
     for key, single, h in spec:
         y -= 18
@@ -1493,8 +1517,12 @@ def show_plan_editor(plan: dict, proposal: Optional[dict] = None) -> Optional[di
     order[-1].setNextKeyView_(order[0])
     _btn(cv, "決定（保存）", _BTN1, NSMakeRect(W - 150, 12, 130, 32), primary=True)
     _btn(cv, "📋 Slack用にコピー", _BTN2, NSMakeRect(W - 320, 12, 160, 32))
-    if proposal and not _plan_is_empty(proposal):
-        _btn(cv, "🤖 提案で置き換え", _BTN3, NSMakeRect(20, 12, 150, 32))
+    replace_btn = _btn(cv, "🤖 提案で置き換え", _BTN3, NSMakeRect(170, 12, 150, 32))
+    suggest_btn = None
+    if on_suggest is not None:
+        suggest_btn = _btn(cv, "🤖 提案してもらう", _BTN4, NSMakeRect(20, 12, 140, 32))
+    holder = {"proposal": _normalize_plan(proposal) if proposal and not _plan_is_empty(proposal) else None,
+              "waiting": False}
 
     def current() -> dict:
         d = {}
@@ -1510,6 +1538,38 @@ def show_plan_editor(plan: dict, proposal: Optional[dict] = None) -> Optional[di
             else:
                 w.setString_(d[key])
 
+    def refresh_status():
+        if holder["waiting"]:
+            status.setStringValue_("🤖 提案を作っています（Slackのやりとりとmdを読む。2〜4分）。この画面を開いたまま待てます")
+        elif holder["proposal"]:
+            status.setStringValue_("🤖 提案が届いています。欄が空なら自動で入ります。入っていれば「提案で置き換え」")
+        else:
+            status.setStringValue_("")
+        replace_btn.setEnabled_(bool(holder["proposal"]))
+        if suggest_btn is not None:
+            suggest_btn.setEnabled_(not holder["waiting"])
+
+    def arrive(d: dict):
+        holder["proposal"] = _normalize_plan(d)
+        holder["waiting"] = False
+        if _plan_is_empty(current()):
+            fill(holder["proposal"])
+        refresh_status()
+        notify("🤖 手順書の提案が届きました", "手順書の画面に反映しました", "")
+
+    # 開いた時点で欄が空で提案があれば、そのまま入れておく
+    if holder["proposal"] and _plan_is_empty(plan):
+        fill(holder["proposal"])
+    refresh_status()
+
+    timer = None
+    if poll_proposal is not None:
+        _plan_poll_handler.poll = poll_proposal
+        _plan_poll_handler.on_arrive = arrive
+        timer = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
+            5.0, _plan_poll_handler, "tick:", None, True)
+        NSRunLoop.mainRunLoop().addTimer_forMode_(timer, NSRunLoopCommonModes)
+
     win.setInitialFirstResponder_(order[0])
     _show(win)
     try:
@@ -1521,13 +1581,24 @@ def show_plan_editor(plan: dict, proposal: Optional[dict] = None) -> Optional[di
                 _show(win)
                 continue
             if resp == _BTN3:
-                fill(proposal or {})
+                if holder["proposal"]:
+                    fill(holder["proposal"])
+                _show(win)
+                continue
+            if resp == _BTN4:
+                if on_suggest is not None and on_suggest():
+                    holder["waiting"] = True
+                refresh_status()
                 _show(win)
                 continue
             if resp == _CANCEL:
                 return None
             return _normalize_plan(current())
     finally:
+        if timer is not None:
+            timer.invalidate()
+        _plan_poll_handler.poll = None
+        _plan_poll_handler.on_arrive = None
         win.orderOut_(None)
         _hide()
 
@@ -4487,7 +4558,9 @@ class ProgressChecker(rumps.App):
             return
         self._checkin_active = True
         try:
-            result = show_plan_editor(self.data.get("plan") or {}, self.data.get("plan_proposal"))
+            result = show_plan_editor(self.data.get("plan") or {}, self.data.get("plan_proposal"),
+                                      on_suggest=lambda: self._run_suggest_plan("手順書の画面から"),
+                                      poll_proposal=self._poll_plan_proposal)
             if result is None:
                 return
             result["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -4498,6 +4571,30 @@ class ProgressChecker(rumps.App):
             notify("🧭 手順書を保存", "Slackに貼るなら「📋 Slack用にコピー」", "")
         finally:
             self._checkin_active = False
+
+    def _poll_plan_proposal(self) -> Optional[dict]:
+        """受信箱に手順書の提案があれば取り出して返す（細分タスクの分は受信箱に残す）。無ければ None。"""
+        if not os.path.exists(INBOX_FILE):
+            return None
+        try:
+            with open(INBOX_FILE, encoding="utf-8") as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            return None
+        if not isinstance(d, dict) or not isinstance(d.get("plan"), dict):
+            return None
+        plan = _normalize_plan(d.pop("plan"))
+        try:
+            if d.get("tasks"):
+                with open(INBOX_FILE, "w", encoding="utf-8") as f:
+                    json.dump(d, f, ensure_ascii=False, indent=1)
+            else:
+                os.remove(INBOX_FILE)
+        except OSError:
+            pass
+        self.data["plan_proposal"] = plan
+        self._save()
+        return plan
 
     def _write_plan_file(self, plan: dict):
         path = os.path.expanduser(self.data.get("plan_file") or DEFAULT_PLAN_FILE)

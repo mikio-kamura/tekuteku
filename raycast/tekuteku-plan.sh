@@ -15,4 +15,4 @@
 # @raycast.description Slackに貼る手順書（次回までに何をやるか）を編集・コピーする
 # @raycast.author mikio_kamura
 
-"$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/trigger.sh" focus
+"$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/trigger.sh" plan
