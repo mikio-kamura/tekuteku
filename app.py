@@ -81,6 +81,9 @@ COPY_REPORT_NOTIFICATION = "jp.tekuteku.copy-report"     # trigger.sh report
 EDIT_KPT_NOTIFICATION = "jp.tekuteku.edit-kpt"           # trigger.sh kpt（日報＝KPT画面を開く）
 DEFAULT_SUGGEST_PLAN_CMD = "/Volumes/ssd_pyoi/Claude-Code/.claude/tools/tekuteku-bridge/suggest_plan.py"
 DEFAULT_PLAN_FILE = "/Volumes/ssd_pyoi/Claude-Code/Research/ZOZO/手順書_現行.md"   # 保存のたびに書き出す正本
+WS_ROOT = "/Volumes/ssd_pyoi/Claude-Code"   # mdの参照を解決する基準（Claude-Code ワークスペース）
+MD_OPEN_TOOL = os.path.join(WS_ROOT, ".claude/tools/open-md.sh")
+MD_EDITOR_START = [os.path.join(WS_ROOT, ".claude/tools/tools.sh"), "start", "md-editor"]
 PLAN_KEYS = ["goal", "policy", "outputs", "this_week", "next_week", "review"]
 PLAN_LABELS = {"goal": "🎯 目的", "policy": "✏️ 課題・方針", "outputs": "🗒 アウトプット",
                "this_week": "📅 今週", "next_week": "📅 来週", "review": "🙏 レビューがほしいタイミング"}
@@ -866,6 +869,102 @@ def _read_inbox(path: str = INBOX_FILE) -> Optional[dict]:
     return {"parent": str(d.get("parent") or ""), "tasks": tasks, "note": str(d.get("note") or ""), "plan": plan}
 
 
+# ── 文中の md 参照をリンクとして開く ─────────────────────────────────────────
+_MD_REF_RE = re.compile(r"[^\s\[\]()（）「」『』、。，,：:]+\.md")
+
+
+def _md_refs(text: str) -> list[str]:
+    """文中の md ファイル参照（`[x](a.md)` のリンク先や `Task/b.md` のような裸のパス）を順に返す。重複は除く。"""
+    out = []
+    for m in _MD_REF_RE.findall(text or ""):
+        if m not in out:
+            out.append(m)
+    return out
+
+
+_MD_SEARCH_DIRS = ["", "Task", "Research/ZOZO", "Research/ZOZO/202610感性工学会", "Research/doctor", "Research/NTT"]
+
+
+def _resolve_md(ref: str, base_dirs: tuple = ()) -> Optional[str]:
+    """参照を実在する絶対パスに。基準フォルダ→ワークスペースの定番フォルダ→ファイル名一致の順で探す。"""
+    ref = ref.strip()
+    if os.path.isabs(ref):
+        return ref if os.path.isfile(ref) else None
+    for base in list(base_dirs) + [os.path.join(WS_ROOT, d) for d in _MD_SEARCH_DIRS]:
+        cand = os.path.normpath(os.path.join(base, ref))
+        if os.path.isfile(cand):
+            return cand
+    name = os.path.basename(ref)
+    for root, dirs, files in os.walk(WS_ROOT):
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d != "node_modules"]
+        if name in files:
+            return os.path.join(root, name)
+    return None
+
+
+def _open_md(abs_path: str) -> bool:
+    """ワークスペース内の md は Webエディタ（止まっていれば起動）のタブで、それ以外は既定のアプリで開く。"""
+    try:
+        rel = os.path.relpath(abs_path, WS_ROOT)
+        if not rel.startswith("..") and os.path.exists(MD_OPEN_TOOL):
+            if os.path.exists(MD_EDITOR_START[0]):
+                subprocess.run(MD_EDITOR_START, capture_output=True, timeout=20)
+            subprocess.run([MD_OPEN_TOOL, rel], capture_output=True, timeout=20)
+            return True
+        subprocess.Popen(["open", abs_path])
+        return True
+    except Exception:
+        return False
+
+
+def _open_md_refs(text: str, base_dirs: tuple = ()) -> int:
+    """文中の md 参照を全部開く。開けた数を返し、0 なら通知で知らせる。"""
+    refs = _md_refs(text)
+    n = 0
+    missing = []
+    for r in refs:
+        path = _resolve_md(r, base_dirs)
+        if path and _open_md(path):
+            n += 1
+        else:
+            missing.append(r)
+    if not refs:
+        notify("📂 mdを開く", "この文に .md の参照がありません", "")
+    elif missing:
+        notify("📂 見つからないmd", "／".join(missing)[:90], "")
+    return n
+
+
+class _LinkHandler(NSObject):
+    """モーダルを閉じずに動くボタン用。tag ごとに登録した関数を呼ぶ。"""
+    actions: dict = {}
+
+    def open_(self, sender):
+        fn = self.actions.get(int(sender.tag()))
+        if fn is not None:
+            try:
+                fn()
+            except Exception:
+                pass
+
+
+_link_handler = _LinkHandler.alloc().init()
+
+
+def _link_btn(cv, title: str, rect, fn) -> NSButton:
+    """押すと fn() を呼ぶだけのボタン（モーダルは止めない）。"""
+    tag = 50000 + len(_link_handler.actions)
+    _link_handler.actions[tag] = fn
+    b = NSButton.alloc().initWithFrame_(rect)
+    b.setTitle_(title)
+    b.setBezelStyle_(1)
+    b.setTag_(tag)
+    b.setTarget_(_link_handler)
+    b.setAction_("open:")
+    cv.addSubview_(b)
+    return b
+
+
 def _copy_to_clipboard(text: str) -> bool:
     try:
         pb = NSPasteboard.generalPasteboard()
@@ -1379,7 +1478,7 @@ def show_list_input(title: str, prompt: str, items: List[str]) -> Optional[List[
         _hide()
 
 
-def show_focus_editor(items: list[tuple[str, str]], n_others: int = 0) -> Optional[list[tuple[str, str]]]:
+def show_focus_editor(items: list[tuple[str, str]], n_others: int = 0, base_dir: str = "") -> Optional[list[tuple[str, str]]]:
     """「いまの集中」の項目を 項目名｜説明 の行で編集する。末尾に空行を2つ足す。項目名も説明も空の行は消える。"""
     rows = list(items) + [("", ""), ("", "")]
     W = 680
@@ -1402,8 +1501,11 @@ def show_focus_editor(items: list[tuple[str, str]], n_others: int = 0) -> Option
     for i, (name, desc) in enumerate(rows):
         y = H - 90 - ROW * (i + 1)
         nf = _input_field(NSMakeRect(20, y, 150, 26), NSFont.systemFontOfSize_(13), placeholder="項目名", default=name)
-        df = _input_field(NSMakeRect(180, y, W - 200, 26), NSFont.systemFontOfSize_(13), placeholder="説明", default=desc)
+        df = _input_field(NSMakeRect(180, y, W - 244, 26), NSFont.systemFontOfSize_(13), placeholder="説明", default=desc)
         cv.addSubview_(nf); cv.addSubview_(df)
+        # 説明に md の参照（[x](a.md) や Task/b.md）があれば、📂 で Webエディタに開く
+        _link_btn(cv, "📂", NSMakeRect(W - 58, y - 1, 38, 28),
+                  (lambda f=df: _open_md_refs(f.stringValue(), (base_dir,) if base_dir else ())))
         fields.append((nf, df))
     flat = [f for pair in fields for f in pair]
     for i in range(len(flat) - 1):
@@ -1510,11 +1612,13 @@ def show_plan_editor(plan: dict, proposal: Optional[dict] = None,
         order[i].setNextKeyView_(order[i + 1])
     order[-1].setNextKeyView_(order[0])
     _btn(cv, "決定（保存）", _BTN1, NSMakeRect(W - 150, 12, 130, 32), primary=True)
-    _btn(cv, "📋 Slack用にコピー", _BTN2, NSMakeRect(W - 320, 12, 160, 32))
-    replace_btn = _btn(cv, "🤖 提案で置き換え", _BTN3, NSMakeRect(170, 12, 150, 32))
+    _btn(cv, "📋 Slackへコピー", _BTN2, NSMakeRect(W - 295, 12, 140, 32))
+    replace_btn = _btn(cv, "🤖 提案で置き換え", _BTN3, NSMakeRect(155, 12, 135, 32))
     suggest_btn = None
     if on_suggest is not None:
-        suggest_btn = _btn(cv, "🤖 提案してもらう", _BTN4, NSMakeRect(20, 12, 140, 32))
+        suggest_btn = _btn(cv, "🤖 提案してもらう", _BTN4, NSMakeRect(20, 12, 130, 32))
+    # 欄の中の md 参照をまとめて開く
+    _link_btn(cv, "📂", NSMakeRect(295, 12, 45, 32), lambda: _open_md_refs("\n".join(current().values())))
     holder = {"proposal": _normalize_plan(proposal) if proposal and not _plan_is_empty(proposal) else None,
               "waiting": False}
 
@@ -1763,8 +1867,8 @@ def show_today_task_editor(title: str, items: list[dict]) -> Optional[tuple]:
 
     _btn(cv, "📅 翌日に移動", _BTN4, NSMakeRect(20, 10, 128, 28))
     if hidden:
-        cv.addSubview_(_label(f"完了済み {len(hidden)} 件は非表示（チェックイン画面で戻せます）",
-                              NSMakeRect(156, 14, W - 156 - 130, 16), NSFont.systemFontOfSize_(11),
+        cv.addSubview_(_label(f"完了済み {len(hidden)} 件は非表示",
+                              NSMakeRect(262, 14, W - 262 - 130, 16), NSFont.systemFontOfSize_(11),
                               color=NSColor.colorWithWhite_alpha_(0.45, 1.0)))
     _btn(cv, "決定（⌘⏎）", _BTN1, NSMakeRect(W - 136, 10, 116, 28), primary=False)
     win.setInitialFirstResponder_(table)
@@ -1788,6 +1892,12 @@ def show_today_task_editor(title: str, items: list[dict]) -> Optional[tuple]:
             out.append(idx)
             idx = sel.indexGreaterThanIndex_(idx)
         return out
+
+    # 選択行の文面にある md 参照を開く（選択が無ければ全行から）
+    def _open_selected_md():
+        rows = selected_indices() or list(range(len(model.items)))
+        _open_md_refs("\n".join(model.items[i]["text"] for i in rows if 0 <= i < len(model.items)))
+    _link_btn(cv, "📂 mdを開く", NSMakeRect(152, 10, 106, 28), _open_selected_md)
 
     def begin_edit(row: int, select_all: bool = True):
         """row の文面編集を始める。文面が空なら、インデント記号を消して打てる状態にする。
@@ -2210,6 +2320,13 @@ def show_checkin(
     field_next     = _input_field(NSMakeRect(X + 20,  112, 95, 26), NSFont.systemFontOfSize_(15), placeholder="番号", default=default_next)
     field_next_next= _input_field(NSMakeRect(X + 123, 112, 95, 26), NSFont.systemFontOfSize_(15), placeholder="番号", default="")
     field_session  = _input_field(NSMakeRect(X + 230, 112, 56, 26), NSFont.systemFontOfSize_(15), default=str(current_interval))
+    # 「次のセッション」の番号のタスク（無ければ今日の全タスク）にある md 参照を Webエディタで開く
+    def _open_next_md():
+        text = _parse_task_index(field_next.stringValue(), today_items)
+        if not text:
+            text = "\n".join(t.get("text", "") for t in today_items)
+        _open_md_refs(text)
+    _link_btn(cv, "📂", NSMakeRect(X + 294, 112, 40, 26), _open_next_md)
     cv.addSubview_(field_next)
     cv.addSubview_(field_next_next)
     cv.addSubview_(field_session)
@@ -3244,6 +3361,7 @@ class ProgressChecker(rumps.App):
             rumps.MenuItem("🗓  今日の目標を変更",      callback=self._cmd_edit_today),
             rumps.MenuItem("🤖 細分タスクを提案してもらう", callback=self._cmd_suggest_tasks),
             rumps.MenuItem("🎯 いま集中すること を編集",   callback=self._cmd_edit_focus),
+            rumps.MenuItem("📂 いまのタスクのmdを開く",     callback=self._cmd_open_task_md),
             None,
             rumps.MenuItem("🧭 手順書を編集（Slack用）",     callback=self._cmd_edit_plan),
             rumps.MenuItem("🤖 手順書を提案してもらう",      callback=self._cmd_suggest_plan),
@@ -4449,7 +4567,7 @@ class ProgressChecker(rumps.App):
         self._checkin_active = True
         try:
             items, others = _focus_items(body)
-            new_items = show_focus_editor(items, n_others=len(others))
+            new_items = show_focus_editor(items, n_others=len(others), base_dir=os.path.dirname(path))
             if new_items is None:
                 return
             lines = _focus_body_from_items(new_items, others)
@@ -4466,6 +4584,13 @@ class ProgressChecker(rumps.App):
             notify("🎯 いま集中すること を保存", _truncate10(md_goal) if md_goal else "", "")
         finally:
             self._checkin_active = False
+
+    def _cmd_open_task_md(self, _):
+        """いまのセッション（と並行タスク）の文面にある md 参照を Webエディタで開く。無ければ今日の全タスクから。"""
+        text = "\n".join(x for x in (self.data.get("current_task", ""), self.data.get("parallel_task", "")) if x)
+        if not _md_refs(text):
+            text = "\n".join(t.get("text", "") for t in _normalize_today(self.data["goals"].get("today", [])))
+        _open_md_refs(text)
 
     def _cmd_edit_focus(self, _):
         self._edit_focus()

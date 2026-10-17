@@ -383,3 +383,16 @@ class ReportAndPlanTests(unittest.TestCase):
             self.assertEqual(box["plan"]["goal"], "x")
         finally:
             os.remove(f.name)
+
+
+class MdRefTests(unittest.TestCase):
+    def test_md_refs_links_and_bare_paths(self):
+        text = "感性工学会（[感性工学会ジャーナル.md](感性工学会ジャーナル.md)）。memory/北岸_指針_20260922.md を開き、Task/あとで箱.md も。"
+        self.assertEqual(app._md_refs(text),
+                         ["感性工学会ジャーナル.md", "memory/北岸_指針_20260922.md", "Task/あとで箱.md"])
+        self.assertEqual(app._md_refs("mdなし"), [])
+
+    def test_resolve_md_by_basename(self):
+        self.assertTrue(app._resolve_md("Task/いま集中すること.md").endswith("/Task/いま集中すること.md"))
+        self.assertTrue(app._resolve_md("いま集中すること.md").endswith("/Task/いま集中すること.md"))
+        self.assertIsNone(app._resolve_md("存在しないファイル_xyz.md"))
