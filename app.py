@@ -3134,6 +3134,9 @@ class ProgressChecker(rumps.App):
         self._check_date_change()
         self._check_week_change()
         self._check_retro_reminder()
+        # ダイアログ中に届いた受信箱は、閉じたあとの最初の tick で取り込む（モーダル中は rumps.Timer が止まるため）
+        if not self._checkin_active and os.path.exists(INBOX_FILE):
+            self._import_inbox()
 
     def _add_to_history(self, date: str, tasks: list):
         if not date or not tasks:
