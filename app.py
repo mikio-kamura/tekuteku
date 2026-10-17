@@ -2393,6 +2393,7 @@ def show_kpt_editor(
     keep: list, problem: list, try_: list,
     kpt_history: list = None,
     trouble: list = None,
+    report_items: list = None,
     date_label: str = "",
     can_go_next: bool = False,
     goals: dict = None,
@@ -2436,6 +2437,8 @@ def show_kpt_editor(
     cv.addSubview_(_label(title_text, NSMakeRect(20, 486, W - 40, 22), NSFont.boldSystemFontOfSize_(13)))
     if on_start_session is not None:
         _btn(cv, "▶ セッションを開始", _BTN_START_SESSION, NSMakeRect(W - 190, 482, 170, 26))
+    # Slack日報（K/P/T・今日やったこと・次やること・困っていること）を、この画面を閉じずにクリップボードへ
+    _btn(cv, "📋 日報をコピー", _BTN4, NSMakeRect(W - 340, 482, 140, 26))
     cv.addSubview_(_label(
         "1行に1つ入力してください",
         NSMakeRect(20, 466, W - 40, 16),
@@ -2485,6 +2488,10 @@ def show_kpt_editor(
     for i in range(len(text_views)):
         text_views[i].setNextKeyView_(text_views[(i + 1) % len(text_views)])
     win.setInitialFirstResponder_(text_views[0])
+
+    def _parse(tv):
+        return [l.strip() for l in str(tv.string()).split("\n") if l.strip()]
+
     _show(win)
     try:
         while True:
@@ -2494,11 +2501,18 @@ def show_kpt_editor(
                     on_start_session()
                 _show(win)  # bring this window back to front and continue
                 continue
+            if resp == _BTN4:
+                _kpt_now = {"keep": _parse(text_views[0]), "problem": _parse(text_views[1]),
+                            "try": _parse(text_views[2]), "trouble": _parse(text_views[3])}
+                if _copy_to_clipboard(_daily_report_text(date_label, _kpt_now, report_items or [])):
+                    notify("📋 日報をコピーしました", "Slackの #prj_zozo に貼ってください", "")
+                else:
+                    notify("📋 日報", "コピーに失敗しました", "")
+                _show(win)
+                continue
             break
         if resp == _CANCEL:
             return None
-        def _parse(tv):
-            return [l.strip() for l in str(tv.string()).split("\n") if l.strip()]
         result = {"keep": _parse(text_views[0]), "problem": _parse(text_views[1]), "try": _parse(text_views[2]),
                   "trouble": _parse(text_views[3])}
         if resp == _BTN2:
@@ -4311,6 +4325,8 @@ class ProgressChecker(rumps.App):
                     existing.get("try", []),
                     kpt_history=kpt_history,
                     trouble=existing.get("trouble", []),
+                    report_items=(self.data["goals"].get("today", []) if current == today_str else
+                                  next((e.get("tasks", []) for e in self.data.get("history", []) if e.get("date") == current), [])),
                     date_label=date_label,
                     can_go_next=can_go_next,
                     goals=self.data.get("goals", {}),
@@ -4637,8 +4653,30 @@ class ProgressChecker(rumps.App):
             return
         self._run_suggest_plan("trigger.sh suggest-plan")
 
+    def _report_text_today(self) -> tuple[str, str]:
+        """(日付ラベル, 今日の日報テキスト)。KPTが未記入なら K/P/T は（なし）になる。"""
+        today_str = self.data.get("today_date", datetime.now().strftime("%Y-%m-%d"))
+        kpt = self.data.get("kpt") or {}
+        if kpt.get("date") != today_str:
+            kpt = next((e for e in self.data.get("kpt_history", []) if e.get("date") == today_str), {})
+        try:
+            d = datetime.strptime(today_str, "%Y-%m-%d")
+            label = f"{d.month}/{d.day}"
+        except ValueError:
+            label = today_str
+        return label, _daily_report_text(label, kpt, self.data["goals"].get("today", []))
+
+    def _copy_report_direct(self):
+        """画面を出さずにクリップボードへ。ダイアログ表示中でも動く（trigger.sh report／Raycast 用）。"""
+        label, text = self._report_text_today()
+        if _copy_to_clipboard(text):
+            notify("📋 日報をコピーしました", f"{label} 分。Slackの #prj_zozo に貼ってください", "")
+        else:
+            notify("📋 日報", "コピーに失敗しました", "")
+
     def _copy_report(self):
         if self._checkin_active:
+            self._copy_report_direct()
             return
         today_str = self.data.get("today_date", datetime.now().strftime("%Y-%m-%d"))
         kpt = self.data.get("kpt") or {}
@@ -4663,8 +4701,7 @@ class ProgressChecker(rumps.App):
     def onExternalCopyReport_(self, notif):
         if not _is_fresh_trigger(notif.userInfo()):
             return
-        NSApp.activateIgnoringOtherApps_(True)
-        self._copy_report()
+        self._copy_report_direct()
 
     # ── Lab arrival tracking ──────────────────────────────────────────────
 
