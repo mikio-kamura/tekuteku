@@ -1482,7 +1482,7 @@ def show_plan_editor(plan: dict, proposal: Optional[dict] = None,
     cv = win.contentView()
     cv.addSubview_(_label("手順書 — Slackの #prj_zozo に貼る「次回までに何をやるか」",
                           NSMakeRect(20, H - 34, W - 40, 22), NSFont.boldSystemFontOfSize_(13)))
-    cv.addSubview_(_label("ゆっくりやって2週間、バッファ十分に。前回の反省を踏まえて実現可能なラインで。箇条書きの欄は1行1つ",
+    cv.addSubview_(_label("ZOZO案件の内容だけ（北岸さんが読む）。各文に主語と述語を。2週間でバッファ十分に、実現可能なラインで。箇条書きの欄は1行1つ",
                           NSMakeRect(20, H - 54, W - 40, 16), NSFont.systemFontOfSize_(11),
                           color=NSColor.colorWithWhite_alpha_(0.5, 1.0)))
     status = _label("", NSMakeRect(20, H - 74, W - 40, 16), NSFont.systemFontOfSize_(11),
