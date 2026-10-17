@@ -17,7 +17,9 @@ macOS のメニューバーに常駐する、定期チェックイン型の進�
 - **KPT 振り返り** — その日の終わりに Keep / Problem / Try を記録。過去の振り返りも見返せる
 - **週次振り返り** — 週をまたぐタイミングで週次レビューも促してくれるよな
 - **記録の閲覧** — 過去のチェックイン履歴をいつでも振り返れる
-- **外から操作（Raycast）** — `trigger.sh checkin` で今すぐチェックイン、`trigger.sh edit-today` で細分タスク編集が開くぜ。Raycast 用のスクリプトコマンドは `raycast/` に2本（チェックイン／細分タスク編集）。Raycast の Settings → Extensions → ＋ → Add Script Directory で `raycast/` を追加してホットキーを割り当てる。ダイアログ表示中に押した分は捨てられるので二重に開かないよな
+- **いま集中すること（md）と同期** — メニュー「🎯 いま集中すること を編集」で、Claude-Code 側の正本 `Task/いま集中すること.md` の「いまの集中」節を1行1項目で直接編集できるぜ（`focus_file` で場所を変えられる）。「今週の計画」の週の目標を保存すると md の「今週の1つ」に写し、週が変わって週の目標が空のときは md の「今週の1つ」を週の目標に入れるよな
+- **外から細分タスクを受け取る** — `~/.tekuteku.inbox.json` に `{"parent": "親", "tasks": [{"text": "…（8分）"}]}` を置いて `trigger.sh reload-inbox` を送ると、今日の目標に親子で足される（同名は飛ばす、ダイアログ中は閉じてから）。Claude Code からは `tekuteku-add` がこれをやってくれるぜ。メニュー「🤖 細分タスクを提案してもらう」（`trigger.sh suggest`）は `suggest_cmd` のスクリプトを裏で走らせる予備ルート。新しい日に未完了が少なければ1日1回自動で走る（`auto_suggest: false` で止める）
+- **外から操作（Raycast）** — `trigger.sh checkin` で今すぐチェックイン、`trigger.sh edit-today` で細分タスク編集が開くぜ。`trigger.sh suggest` で提案、`trigger.sh focus` でいま集中することの編集。Raycast 用のスクリプトコマンドは `raycast/` に4本（チェックイン／細分タスク編集／提案／いま集中すること）。Raycast の Settings → Extensions → ＋ → Add Script Directory で `raycast/` を追加してホットキーを割り当てる。ダイアログ表示中に押した分は捨てられるので二重に開かないよな
 
 ---
 

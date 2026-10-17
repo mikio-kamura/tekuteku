@@ -278,3 +278,67 @@ class ActivitySessionTaskTests(unittest.TestCase):
         self.assertEqual(obj.data["current_task"], "")
         self.assertTrue(obj._timer.stopped)
         self.assertGreater(obj._next_checkin_at, app.datetime.now() + app.timedelta(days=300))
+
+
+class FocusFileTests(unittest.TestCase):
+    MD = (
+        "# いま集中すること\n\n前書き\n\n## いまの集中\n\n"
+        "- **今週の1つ**：感性工学会 [x](a.md) を出す\n- **決めごと**：日曜21:00\n\n"
+        "## ゲートを通さなくていいもの\n\n- **健康**：体調\n\n## 更新履歴\n\n- 2026-09-13 初版\n"
+    )
+
+    def test_body_and_get(self):
+        body = app._focus_body(self.MD.split("\n"))
+        self.assertEqual(body, ["- **今週の1つ**：感性工学会 [x](a.md) を出す", "- **決めごと**：日曜21:00"])
+        self.assertEqual(app._strip_md_links(app._focus_get(body, "今週の1つ")), "感性工学会 x を出す")
+        self.assertEqual(app._focus_get(body, "ない"), "")
+
+    def test_set_replaces_or_prepends(self):
+        body = app._focus_body(self.MD.split("\n"))
+        b2 = app._focus_set(body, "今週の1つ", "新しい目標")
+        self.assertEqual(b2[0], "- **今週の1つ**：新しい目標")
+        self.assertEqual(len(b2), 2)
+        b3 = app._focus_set(body, "締切", "10/20")
+        self.assertEqual(b3[0], "- **締切**：10/20")
+        self.assertEqual(len(b3), 3)
+
+    def test_replace_keeps_other_sections_and_logs(self):
+        body = ["- **今週の1つ**：A"]
+        out = app._focus_replace(self.MD, body, note="てくてくから更新", today="2026-10-17")
+        self.assertIn("## いまの集中\n\n- **今週の1つ**：A\n\n## ゲートを通さなくていいもの", out)
+        self.assertIn("## 更新履歴\n\n- 2026-10-17 てくてくから更新\n- 2026-09-13 初版", out)
+        self.assertTrue(out.startswith("# いま集中すること\n\n前書き"))
+
+    def test_replace_without_section_is_noop(self):
+        self.assertEqual(app._focus_replace("# x\n\n## 別\n", ["- a"]), "# x\n\n## 別\n")
+
+
+class InboxMergeTests(unittest.TestCase):
+    def test_merge_creates_parent_and_children(self):
+        items = [{"text": "既存", "done": True, "level": 0}]
+        out, n = app._merge_inbox(items, "🤖 提案", ["a（5分）", {"text": "b（8分）"}, "a（5分）", ""])
+        self.assertEqual(n, 2)
+        self.assertEqual([(t["text"], t["level"]) for t in out],
+                         [("既存", 0), ("🤖 提案", 0), ("a（5分）", 1), ("b（8分）", 1)])
+
+    def test_merge_appends_under_existing_parent_and_skips_dupes(self):
+        items = [{"text": "🤖 提案", "done": True, "level": 0}, {"text": "a", "done": True, "level": 1},
+                 {"text": "次", "done": False, "level": 0}]
+        out, n = app._merge_inbox(items, "🤖 提案", ["a", "c"])
+        self.assertEqual(n, 1)
+        self.assertEqual([t["text"] for t in out], ["🤖 提案", "a", "c", "次"])
+        self.assertFalse(out[0]["done"])  # 親は未完了に戻る
+
+    def test_merge_without_parent_adds_top_level(self):
+        out, n = app._merge_inbox([], "", ["x"])
+        self.assertEqual(n, 1)
+        self.assertEqual(out, [{"text": "x", "done": False, "level": 0}])
+
+    def test_read_inbox_rejects_garbage(self):
+        import tempfile, os
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write("{nope")
+        try:
+            self.assertIsNone(app._read_inbox(f.name))
+        finally:
+            os.remove(f.name)

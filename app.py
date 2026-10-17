@@ -3,6 +3,8 @@
 import ctypes
 import json
 import os
+import re
+import subprocess
 os.environ.setdefault('OS_ACTIVITY_MODE', 'disable')  # suppress macOS framework log noise
 import random
 from datetime import datetime, timedelta
@@ -60,6 +62,17 @@ _OLD_DATA_FILE = os.path.expanduser("~/.progress_checker.json")
 DEFAULT_INTERVAL = 20  # minutes
 CHECKIN_NOTIFICATION = "jp.tekuteku.checkin-now"      # 外部から「今すぐチェックイン」を起こす分散通知（trigger.sh）
 EDIT_TODAY_NOTIFICATION = "jp.tekuteku.edit-today"    # 外部から「細分タスク編集」を開く分散通知
+INBOX_NOTIFICATION = "jp.tekuteku.reload-inbox"       # 受信箱（INBOX_FILE）を読み込ませる分散通知（suggest_tasks.py が送る）
+SUGGEST_NOTIFICATION = "jp.tekuteku.suggest"          # Claude に細分タスクを提案させる（trigger.sh suggest）
+EDIT_FOCUS_NOTIFICATION = "jp.tekuteku.edit-focus"    # 「いま集中すること」を編集する（trigger.sh focus）
+INBOX_FILE = os.path.expanduser("~/.tekuteku.inbox.json")   # 外部ツールが細分タスクを置く受信箱。取り込んだら消す
+# 「いま集中すること」(Claude-Code の Task/いま集中すること.md) との連携。data["focus_file"] で上書き可
+DEFAULT_FOCUS_FILE = "/Volumes/ssd_pyoi/Claude-Code/Task/いま集中すること.md"
+FOCUS_SECTION = "## いまの集中"
+FOCUS_WEEK_KEY = "今週の1つ"          # この項目 ⇄ てくてくの「週の目標」
+# 細分タスクの提案コマンド（受信箱に書いて INBOX_NOTIFICATION を送る側）。data["suggest_cmd"] で上書き可
+DEFAULT_SUGGEST_CMD = "/Volumes/ssd_pyoi/Claude-Code/.claude/tools/tekuteku-bridge/suggest_tasks.py"
+SUGGEST_LOG = "/tmp/tekuteku-suggest.log"
 TRIGGER_MAX_AGE_SEC = 3.0  # これより古い通知は捨てる（ダイアログ中に届いた通知は閉じた後にまとめて配送されるため）
 BREAK_MINUTES = 5
 WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
@@ -698,6 +711,144 @@ def _parse_day_tasks(raw) -> list[str]:
                 out.append((item.get("text") or "").strip())
         return [s for s in out if s]
     return []
+
+
+# ── 「いま集中すること」(md) との連携 ──────────────────────────────────────
+# md の「## いまの集中」節を行のリストとして読み書きする。項目は `- **項目名**：説明` の形。
+
+def _focus_section_span(lines: list[str]) -> Optional[tuple[int, int]]:
+    """FOCUS_SECTION の本文行の範囲 [start, end)（見出し行は含まない。次の `## ` の手前まで）。"""
+    start = None
+    for i, ln in enumerate(lines):
+        if ln.strip() == FOCUS_SECTION:
+            start = i + 1
+            break
+    if start is None:
+        return None
+    end = len(lines)
+    for j in range(start, len(lines)):
+        if lines[j].startswith("## "):
+            end = j
+            break
+    return start, end
+
+
+def _focus_body(lines: list[str]) -> list[str]:
+    span = _focus_section_span(lines)
+    if span is None:
+        return []
+    return [ln for ln in lines[span[0]:span[1]] if ln.strip()]
+
+
+def _focus_get(body: list[str], key: str) -> str:
+    """`- **key**：説明` の説明部分。無ければ ""。"""
+    pat = re.compile(r"^\s*[-*]\s*\*\*" + re.escape(key) + r"\*\*\s*[：:]\s*(.*)$")
+    for ln in body:
+        m = pat.match(ln)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def _focus_set(body: list[str], key: str, desc: str) -> list[str]:
+    """key の行を差し替える（無ければ先頭に足す）。"""
+    pat = re.compile(r"^\s*[-*]\s*\*\*" + re.escape(key) + r"\*\*\s*[：:]")
+    new_line = f"- **{key}**：{desc.strip()}"
+    out = list(body)
+    for i, ln in enumerate(out):
+        if pat.match(ln):
+            out[i] = new_line
+            return out
+    return [new_line] + out
+
+
+def _strip_md_links(text: str) -> str:
+    return re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text).strip()
+
+
+def _focus_read(path: str) -> Optional[list[str]]:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return _focus_body(f.read().split("\n"))
+    except OSError:
+        return None
+
+
+def _focus_replace(text: str, body: list[str], note: str = "", today: str = "") -> str:
+    """md 全文のうち FOCUS_SECTION の本文を body に差し替え、更新履歴の先頭に note を足す。"""
+    lines = text.split("\n")
+    span = _focus_section_span(lines)
+    if span is None:
+        return text
+    new_body = [ln for ln in body if ln.strip()]
+    lines = lines[:span[0]] + [""] + new_body + [""] + lines[span[1]:]
+    if note:
+        today = today or datetime.now().strftime("%Y-%m-%d")
+        for i, ln in enumerate(lines):
+            if ln.strip() == "## 更新履歴":
+                k = i + 1
+                while k < len(lines) and not lines[k].strip():
+                    k += 1
+                lines.insert(k, f"- {today} {note}")
+                break
+    return "\n".join(lines)
+
+
+def _focus_write(path: str, body: list[str], note: str = "") -> bool:
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        new = _focus_replace(text, body, note)
+        if new == text:
+            return True
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(new)
+        return True
+    except OSError:
+        return False
+
+
+# ── 受信箱（外部ツールからの細分タスク） ───────────────────────────────────────
+
+def _merge_inbox(items: list, parent: str, tasks: list) -> tuple[list, int]:
+    """items（今日の細分タスク）に、親 parent の下へ tasks（str か {"text"}）を子として足す。
+    同名の行があれば飛ばす。親が無ければ末尾に作る。(新しい items, 追加数) を返す。"""
+    items = _normalize_today(items)
+    texts = {t["text"] for t in items}
+    new = []
+    for t in tasks:
+        text = (t.get("text") if isinstance(t, dict) else str(t)) or ""
+        text = text.strip()
+        if text and text not in texts:
+            new.append(text)
+            texts.add(text)
+    if not new:
+        return items, 0
+    if not parent:
+        items.extend({"text": t, "done": False, "level": 0} for t in new)
+        return _normalize_levels(items), len(new)
+    pidx = next((i for i, t in enumerate(items) if t["text"] == parent and int(t.get("level", 0) or 0) == 0), None)
+    if pidx is None:
+        items.append({"text": parent, "done": False, "level": 0})
+        pidx = len(items) - 1
+    else:
+        items[pidx]["done"] = False
+    end = _subtree_end(items, pidx)
+    children = [{"text": t, "done": False, "level": 1} for t in new]
+    items[end:end] = children
+    return _normalize_levels(items), len(new)
+
+
+def _read_inbox(path: str = INBOX_FILE) -> Optional[dict]:
+    """受信箱を読む。{"parent": str, "tasks": [...], "note": str} か None。壊れていれば None。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(d, dict) or not isinstance(d.get("tasks"), list):
+        return None
+    return {"parent": str(d.get("parent") or ""), "tasks": d["tasks"], "note": str(d.get("note") or "")}
 
 
 def _arrival_color(time_str: str):
@@ -2733,6 +2884,8 @@ class ProgressChecker(rumps.App):
             rumps.MenuItem("📌 短期目標を変更",        callback=self._cmd_edit_short),
             rumps.MenuItem("📋 今週の計画を変更",        callback=self._cmd_edit_weekly),
             rumps.MenuItem("🗓  今日の目標を変更",      callback=self._cmd_edit_today),
+            rumps.MenuItem("🤖 細分タスクを提案してもらう", callback=self._cmd_suggest_tasks),
+            rumps.MenuItem("🎯 いま集中すること を編集",   callback=self._cmd_edit_focus),
             None,
             rumps.MenuItem("📜 過去の記録を見る",         callback=self._cmd_show_history),
             rumps.MenuItem("🏢 ラボ到着を記録",            callback=self._cmd_record_lab_arrival),
@@ -2765,6 +2918,11 @@ class ProgressChecker(rumps.App):
         _dnc = NSDistributedNotificationCenter.defaultCenter()
         _dnc.addObserver_selector_name_object_(self, "onExternalCheckin:", CHECKIN_NOTIFICATION, None)
         _dnc.addObserver_selector_name_object_(self, "onExternalEditToday:", EDIT_TODAY_NOTIFICATION, None)
+        _dnc.addObserver_selector_name_object_(self, "onInboxReload:", INBOX_NOTIFICATION, None)
+        _dnc.addObserver_selector_name_object_(self, "onExternalSuggest:", SUGGEST_NOTIFICATION, None)
+        _dnc.addObserver_selector_name_object_(self, "onExternalEditFocus:", EDIT_FOCUS_NOTIFICATION, None)
+        self._focus_pull()
+        self._import_inbox()
         if not self.data["goals"].get("short"):
             rumps.Timer(self._first_run, 1).start()
         else:
@@ -2805,6 +2963,10 @@ class ProgressChecker(rumps.App):
                 data.setdefault("lab_arrivals", {})
                 data.setdefault("deferred_tasks", [])
                 data.setdefault("retro_reminded", {"date": "", "hours": []})
+                data.setdefault("focus_file", DEFAULT_FOCUS_FILE)
+                data.setdefault("suggest_cmd", DEFAULT_SUGGEST_CMD)
+                data.setdefault("auto_suggest", True)
+                data.setdefault("suggested_date", "")
                 return data
             except Exception:
                 pass
@@ -2829,6 +2991,10 @@ class ProgressChecker(rumps.App):
             "history": [],
             "lab_arrivals": {},
             "deferred_tasks": [],
+            "focus_file": DEFAULT_FOCUS_FILE,
+            "suggest_cmd": DEFAULT_SUGGEST_CMD,
+            "auto_suggest": True,
+            "suggested_date": "",
         }
 
     def _save(self):
@@ -3037,6 +3203,8 @@ class ProgressChecker(rumps.App):
         self._refresh_ui()
         self._update_lab_reminder_timer()
         self._check_week_change()
+        self._focus_pull()
+        self._import_inbox()
         if not self._checkin_active:
             rumps.Timer(self._prompt_new_day, 2).start()
             rumps.Timer(self._prompt_missed_retro, 4).start()
@@ -3135,6 +3303,7 @@ class ProgressChecker(rumps.App):
         if self._checkin_active:
             return
         notify("🌅 新しい日が始まりました！", "今日のタスクを追加しましょう")
+        self._maybe_auto_suggest()
         self._edit_today()
 
     # ── Core flows ────────────────────────────────────────────────────────
@@ -3675,6 +3844,7 @@ class ProgressChecker(rumps.App):
                 weekly["days"] = result["days"]
                 self.data["goals"]["weekly"] = weekly
                 self._save()
+                self._focus_push_week_goal()
                 self._finish_activity_session(_plan_task)
         finally:
             self._checkin_active = False
@@ -3850,6 +4020,159 @@ class ProgressChecker(rumps.App):
             if t["text"] and t["text"] not in existing_texts:
                 existing.append(t)
                 existing_texts.add(t["text"])
+
+    # ── 「いま集中すること」(md) 連携 ────────────────────────────────────────
+
+    def _focus_path(self) -> str:
+        return os.path.expanduser(self.data.get("focus_file") or DEFAULT_FOCUS_FILE)
+
+    def _focus_pull(self):
+        """md の「今週の1つ」をてくてくの週の目標へ。週の目標が空のとき（新しい週など）だけ上書きする。"""
+        body = _focus_read(self._focus_path())
+        if not body:
+            return
+        md_goal = _strip_md_links(_focus_get(body, FOCUS_WEEK_KEY))
+        if not md_goal:
+            return
+        weekly = _normalize_weekly(self.data["goals"].get("weekly", {}))
+        if weekly.get("goal"):
+            return
+        weekly["goal"] = md_goal
+        self.data["goals"]["weekly"] = weekly
+        self._save()
+
+    def _focus_push_week_goal(self):
+        """てくてくの週の目標を md の「今週の1つ」へ（違うときだけ書く）。"""
+        weekly = _normalize_weekly(self.data["goals"].get("weekly", {}))
+        goal = (weekly.get("goal") or "").strip()
+        if not goal:
+            return
+        path = self._focus_path()
+        body = _focus_read(path)
+        if body is None:
+            return
+        if _strip_md_links(_focus_get(body, FOCUS_WEEK_KEY)) == goal:
+            return
+        new_body = _focus_set(body, FOCUS_WEEK_KEY, goal)
+        if _focus_write(path, new_body, note="てくてくの「今週の計画」から今週の1つを更新"):
+            notify("🎯 いま集中すること を更新", f"今週の1つ: {_truncate10(goal)}", "")
+
+    def _edit_focus(self):
+        """md の「いまの集中」節を1行1項目で編集する。保存したら「今週の1つ」を週の目標にも写す。"""
+        if self._checkin_active:
+            return
+        path = self._focus_path()
+        body = _focus_read(path)
+        if body is None:
+            notify("🎯 いま集中すること", "ファイルが見つかりません", path)
+            return
+        self._checkin_active = True
+        try:
+            lines = show_list_input(
+                "いま集中すること（md の正本を直接編集）",
+                "「- **項目名**：説明」の形で1行1項目。先頭の行が今週の1つ",
+                body,
+            )
+            if lines is None:
+                return
+            if not _focus_write(path, lines, note="てくてくから「いまの集中」を編集"):
+                notify("🎯 いま集中すること", "書き込めませんでした", path)
+                return
+            md_goal = _strip_md_links(_focus_get(lines, FOCUS_WEEK_KEY))
+            if md_goal:
+                weekly = _normalize_weekly(self.data["goals"].get("weekly", {}))
+                if weekly.get("goal") != md_goal:
+                    weekly["goal"] = md_goal
+                    self.data["goals"]["weekly"] = weekly
+                    self._save()
+            notify("🎯 いま集中すること を保存", _truncate10(md_goal) if md_goal else "", "")
+        finally:
+            self._checkin_active = False
+
+    def _cmd_edit_focus(self, _):
+        self._edit_focus()
+
+    def onExternalEditFocus_(self, notif):
+        if not _is_fresh_trigger(notif.userInfo()):
+            return
+        NSApp.activateIgnoringOtherApps_(True)
+        self._edit_focus()
+
+    # ── 受信箱と細分タスクの提案 ─────────────────────────────────────────────
+
+    def _import_inbox(self):
+        """INBOX_FILE があれば今日の細分タスクに取り込んで消す。
+        ダイアログ表示中は（編集中の内容と衝突するので）閉じるまで待ってから取り込む。"""
+        if not os.path.exists(INBOX_FILE):
+            return
+        if self._checkin_active:
+            rumps.Timer(self._retry_import_inbox, 15).start()
+            return
+        box = _read_inbox()
+        try:
+            os.remove(INBOX_FILE)
+        except OSError:
+            pass
+        if box is None:
+            notify("🤖 受信箱", "中身が読めなかったので捨てました", INBOX_FILE)
+            return
+        items, n = _merge_inbox(self.data["goals"].get("today", []), box["parent"], box["tasks"])
+        self.data["goals"]["today"] = items
+        self._save()
+        self._refresh_ui()
+        if n:
+            notify("🤖 細分タスクを追加", f"{n}件（{box['parent'] or '直下'}）", box["note"][:80])
+        else:
+            notify("🤖 細分タスク", "追加なし（すべて既にあります）", box["note"][:80])
+
+    def _retry_import_inbox(self, timer: rumps.Timer):
+        timer.stop()
+        self._import_inbox()
+
+    def onInboxReload_(self, notif):
+        self._import_inbox()
+
+    def _suggest_cmd(self) -> str:
+        return os.path.expanduser(self.data.get("suggest_cmd") or DEFAULT_SUGGEST_CMD)
+
+    def _run_suggest(self, reason: str = "") -> bool:
+        """提案コマンドを裏で走らせる。コマンド側が受信箱に書いて INBOX_NOTIFICATION を送ってくる。"""
+        cmd = self._suggest_cmd()
+        if not os.path.exists(cmd):
+            notify("🤖 細分タスクの提案", "提案コマンドが見つかりません", cmd)
+            return False
+        try:
+            log = open(SUGGEST_LOG, "a")
+            subprocess.Popen([cmd], start_new_session=True, stdin=subprocess.DEVNULL,
+                             stdout=log, stderr=subprocess.STDOUT)
+        except OSError as e:
+            notify("🤖 細分タスクの提案", "起動に失敗", str(e)[:80])
+            return False
+        self.data["suggested_date"] = datetime.now().strftime("%Y-%m-%d")
+        self._save()
+        notify("🤖 細分タスクを考えています", "1〜3分で今日の目標に足されます", reason)
+        return True
+
+    def _maybe_auto_suggest(self):
+        """新しい日の最初に1回だけ、未完了の細分タスクが少なければ提案を走らせる。"""
+        if not self.data.get("auto_suggest", True):
+            return
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        if self.data.get("suggested_date") == today_str:
+            return
+        items = _normalize_today(self.data["goals"].get("today", []))
+        undone = [t for i, t in enumerate(items) if not t["done"] and _is_leaf(items, i)]
+        if len(undone) >= 4:
+            return
+        self._run_suggest("新しい日の自動提案")
+
+    def _cmd_suggest_tasks(self, _):
+        self._run_suggest("メニューから")
+
+    def onExternalSuggest_(self, notif):
+        if not _is_fresh_trigger(notif.userInfo()):
+            return
+        self._run_suggest("trigger.sh suggest")
 
     # ── Lab arrival tracking ──────────────────────────────────────────────
 

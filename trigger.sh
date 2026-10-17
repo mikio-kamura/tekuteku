@@ -2,6 +2,9 @@
 # てくてくを外から操作する。起動中の app.py が NSDistributedNotificationCenter で受け取る。
 #   trigger.sh checkin      今すぐチェックイン
 #   trigger.sh edit-today   細分タスク編集を開く
+#   trigger.sh suggest      Claude に今日の細分タスクを提案させる（5〜10分の粒度。受信箱経由で足される）
+#   trigger.sh focus        「いま集中すること」(md) を編集する
+#   trigger.sh reload-inbox 受信箱 ~/.tekuteku.inbox.json を取り込ませる（suggest_tasks.py が使う）
 # 送信時刻を添えるので、ダイアログ表示中に押した分は（閉じた後に配送されても）捨てられる。
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="$DIR/.venv/bin/python"
@@ -9,7 +12,10 @@ PY="$DIR/.venv/bin/python"
 case "${1:-checkin}" in
   checkin)    NAME="jp.tekuteku.checkin-now" ;;
   edit-today) NAME="jp.tekuteku.edit-today" ;;
-  *) echo "usage: trigger.sh checkin|edit-today" >&2; exit 2 ;;
+  suggest)    NAME="jp.tekuteku.suggest" ;;
+  focus)      NAME="jp.tekuteku.edit-focus" ;;
+  reload-inbox) NAME="jp.tekuteku.reload-inbox" ;;
+  *) echo "usage: trigger.sh checkin|edit-today|suggest|focus|reload-inbox" >&2; exit 2 ;;
 esac
 exec "$PY" - "$NAME" <<'PYEOF'
 import sys, time
