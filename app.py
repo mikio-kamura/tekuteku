@@ -1574,8 +1574,9 @@ def show_card_review(cards: list, rate_fn, intervals: list) -> int:
     q = _mlabel("", NSMakeRect(20, H - 150, W - 40, 88), NSFont.systemFontOfSize_(15),
                 color=NSColor.colorWithWhite_alpha_(0.15, 1.0))
     cv.addSubview_(head); cv.addSubview_(chip); cv.addSubview_(q)
-    cv.addSubview_(_label("1行で思い出して書く（任意。書いた方が残る）", NSMakeRect(20, H - 170, W - 40, 16),
-                          NSFont.systemFontOfSize_(11), color=gray))
+    recall_label = _label("1行で思い出して書く（任意。書いた方が残る）", NSMakeRect(20, H - 170, W - 40, 16),
+                          NSFont.systemFontOfSize_(11), color=gray)
+    cv.addSubview_(recall_label)
     recall_scroll, recall_tv = _text_view([], NSMakeRect(20, H - 226, W - 40, 52))
     recall_tv.setFont_(NSFont.systemFontOfSize_(13))
     cv.addSubview_(recall_scroll)
@@ -1611,6 +1612,7 @@ def show_card_review(cards: list, rate_fn, intervals: list) -> int:
             q.setStringValue_(f"✅ 思い出せた {st['ok']}　🟡 だいたい {st['so']}　❌ 忘れてた {st['ng']}\n"
                               "記録は Research/doctor/研究の型/学習ログ/ に残しました。")
             recall_scroll.setHidden_(True)
+            recall_label.setHidden_(True)
             set_hidden(True)
             widgets["reveal"].setEnabled_(False)
             return
@@ -1630,7 +1632,10 @@ def show_card_review(cards: list, rate_fn, intervals: list) -> int:
             return
         st["revealed"] = True
         src = "、".join(t for t, _ in c.get("src", []))
-        ans_tv.setString_(c.get("a", "").replace("／", "\n・ ") + ("\n\n出典: " + src if src else ""))
+        body = c.get("a", "")
+        if "／" in body:
+            body = "・ " + body.replace("／", "\n・ ")
+        ans_tv.setString_(body + ("\n\n出典: " + src if src else ""))
         set_hidden(False)
         win.makeFirstResponder_(memo_tv)
 
