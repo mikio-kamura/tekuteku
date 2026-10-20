@@ -79,6 +79,8 @@ EDIT_PLAN_NOTIFICATION = "jp.tekuteku.edit-plan"         # trigger.sh plan
 SUGGEST_PLAN_NOTIFICATION = "jp.tekuteku.suggest-plan"   # trigger.sh suggest-plan
 COPY_REPORT_NOTIFICATION = "jp.tekuteku.copy-report"     # trigger.sh report
 EDIT_KPT_NOTIFICATION = "jp.tekuteku.edit-kpt"           # trigger.sh kpt（日報＝KPT画面を開く）
+REVIEW_CARDS_NOTIFICATION = "jp.tekuteku.cards"           # trigger.sh cards（学びカードを1枚ずつ振り返る）
+MANABI_DIR = "/Volumes/ssd_pyoi/Claude-Code/.claude/tools/manabi-cards"   # 学びカード（Scrapboxの学びの間隔反復）のロジック置き場
 DEFAULT_SUGGEST_PLAN_CMD = "/Volumes/ssd_pyoi/Claude-Code/.claude/tools/tekuteku-bridge/suggest_plan.py"
 DEFAULT_PLAN_FILE = "/Volumes/ssd_pyoi/Claude-Code/Research/ZOZO/手順書_現行.md"   # 保存のたびに書き出す正本
 WS_ROOT = "/Volumes/ssd_pyoi/Claude-Code"   # mdの参照を解決する基準（Claude-Code ワークスペース）
@@ -1527,6 +1529,151 @@ def show_focus_editor(items: list[tuple[str, str]], n_others: int = 0, base_dir:
     finally:
         win.orderOut_(None)
         _hide()
+
+
+_manabi_mod = None
+
+
+def _manabi():
+    """学びカード（manabi-cards/server.py）のロジックを読み込む。標準ライブラリだけで動く。無ければ None。"""
+    global _manabi_mod
+    if _manabi_mod is not None:
+        return _manabi_mod
+    try:
+        import importlib.util
+        path = os.path.join(MANABI_DIR, "server.py")
+        spec = importlib.util.spec_from_file_location("manabi_server", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _manabi_mod = mod
+        return mod
+    except Exception:
+        return None
+
+
+def _manabi_today() -> tuple[list, dict]:
+    """今日出す学びカードと統計。読むだけ（新規カードの導入は記録しない）。失敗したら ([], {})。"""
+    m = _manabi()
+    if m is None:
+        return [], {}
+    try:
+        return m.session_cards()
+    except Exception:
+        return [], {}
+
+
+def show_card_review(cards: list, rate_fn, intervals: list) -> int:
+    """学びカードを同じ窓で1枚ずつ：問い→（任意で1行思い出す）→答えを見る→思い出せた／だいたい／忘れてた。
+    rate_fn(card_id, rating, memo, recall) で記録する。戻り値は評価した枚数。"""
+    W, H = 620, 560
+    win = _make_win("📚 学びカード", W, H)
+    cv = win.contentView()
+    gray = NSColor.colorWithWhite_alpha_(0.5, 1.0)
+    head = _label("", NSMakeRect(20, H - 34, W - 40, 22), NSFont.boldSystemFontOfSize_(13))
+    chip = _label("", NSMakeRect(20, H - 54, W - 40, 16), NSFont.systemFontOfSize_(11), color=gray)
+    q = _mlabel("", NSMakeRect(20, H - 150, W - 40, 88), NSFont.systemFontOfSize_(15),
+                color=NSColor.colorWithWhite_alpha_(0.15, 1.0))
+    cv.addSubview_(head); cv.addSubview_(chip); cv.addSubview_(q)
+    cv.addSubview_(_label("1行で思い出して書く（任意。書いた方が残る）", NSMakeRect(20, H - 170, W - 40, 16),
+                          NSFont.systemFontOfSize_(11), color=gray))
+    recall_scroll, recall_tv = _text_view([], NSMakeRect(20, H - 226, W - 40, 52))
+    recall_tv.setFont_(NSFont.systemFontOfSize_(13))
+    cv.addSubview_(recall_scroll)
+    ans_label = _label("答え", NSMakeRect(20, H - 248, W - 40, 16), NSFont.boldSystemFontOfSize_(12))
+    ans_scroll, ans_tv = _text_view([], NSMakeRect(20, 146, W - 40, H - 400))
+    ans_tv.setFont_(NSFont.systemFontOfSize_(13))
+    ans_tv.setEditable_(False)
+    cv.addSubview_(ans_label); cv.addSubview_(ans_scroll)
+    memo_label = _label("この2週間で使えた場面／使えなかった場面（任意、1行）", NSMakeRect(20, 126, W - 40, 16),
+                        NSFont.systemFontOfSize_(11), color=gray)
+    memo_scroll, memo_tv = _text_view([], NSMakeRect(20, 96, W - 40, 28))
+    memo_tv.setFont_(NSFont.systemFontOfSize_(13))
+    cv.addSubview_(memo_label); cv.addSubview_(memo_scroll)
+    st = {"i": 0, "revealed": False, "n": 0, "ok": 0, "so": 0, "ng": 0}
+    widgets = {}
+
+    def cur():
+        return cards[st["i"]] if st["i"] < len(cards) else None
+
+    def set_hidden(hidden: bool):
+        for w in (ans_label, ans_scroll, memo_label, memo_scroll):
+            w.setHidden_(hidden)
+        for k in ("ok", "so", "ng"):
+            widgets[k].setEnabled_(not hidden)
+        widgets["reveal"].setEnabled_(hidden)
+        widgets["src"].setEnabled_(not hidden)
+
+    def load():
+        c = cur()
+        if c is None:
+            head.setStringValue_("今日の分はおしまい")
+            chip.setStringValue_("")
+            q.setStringValue_(f"✅ 思い出せた {st['ok']}　🟡 だいたい {st['so']}　❌ 忘れてた {st['ng']}\n"
+                              "記録は Research/doctor/研究の型/学習ログ/ に残しました。")
+            recall_scroll.setHidden_(True)
+            set_hidden(True)
+            widgets["reveal"].setEnabled_(False)
+            return
+        st["revealed"] = False
+        head.setStringValue_(f"📚 学びカード  {st['i'] + 1} / {len(cards)}")
+        chip.setStringValue_(f"{c.get('cat', '')}　・　{'新規' if c.get('new') else '箱' + str(c.get('box', 0))}　・　{c.get('title', '')}")
+        q.setStringValue_(c.get("q", ""))
+        recall_tv.setString_("")
+        memo_tv.setString_("")
+        ans_tv.setString_("")
+        set_hidden(True)
+        win.makeFirstResponder_(recall_tv)
+
+    def reveal():
+        c = cur()
+        if c is None or st["revealed"]:
+            return
+        st["revealed"] = True
+        src = "、".join(t for t, _ in c.get("src", []))
+        ans_tv.setString_(c.get("a", "").replace("／", "\n・ ") + ("\n\n出典: " + src if src else ""))
+        set_hidden(False)
+        win.makeFirstResponder_(memo_tv)
+
+    def open_src():
+        c = cur()
+        if c is None:
+            return
+        for _, url in c.get("src", [])[:1]:
+            try:
+                subprocess.Popen(["open", url])
+            except Exception:
+                pass
+
+    def rate(r):
+        c = cur()
+        if c is None or not st["revealed"]:
+            return
+        try:
+            rate_fn(c["id"], r, str(memo_tv.string()), str(recall_tv.string()))
+        except Exception:
+            pass
+        st[r] += 1
+        st["n"] += 1
+        st["i"] += 1
+        load()
+
+    widgets["reveal"] = _link_btn(cv, "答えを見る ⏎", NSMakeRect(20, 52, 130, 32), reveal)
+    widgets["reveal"].setKeyEquivalent_("\r")
+    widgets["ok"] = _link_btn(cv, "✅ 思い出せた", NSMakeRect(160, 52, 140, 32), lambda: rate("ok"))
+    widgets["so"] = _link_btn(cv, "🟡 だいたい", NSMakeRect(310, 52, 130, 32), lambda: rate("so"))
+    widgets["ng"] = _link_btn(cv, "❌ 忘れてた", NSMakeRect(450, 52, 130, 32), lambda: rate("ng"))
+    widgets["src"] = _link_btn(cv, "📄 出典（Scrapbox）を開く", NSMakeRect(20, 12, 200, 32), open_src)
+    _btn(cv, "閉じる", _BTN2, NSMakeRect(W - 120, 12, 100, 32))
+    cv.addSubview_(_label("間隔: 思い出せた→" + "→".join(str(d) for d in intervals) + "日と伸びる。忘れてた→翌日",
+                          NSMakeRect(230, 18, W - 360, 16), NSFont.systemFontOfSize_(10), color=gray))
+    load()
+    _show(win)
+    try:
+        NSApp.runModalForWindow_(win)
+    finally:
+        win.orderOut_(None)
+        _hide()
+    return st["n"]
 
 
 def show_copy_text(title: str, text: str, hint: str = "") -> None:
@@ -3344,6 +3491,8 @@ class ProgressChecker(rumps.App):
         self._next_item = rumps.MenuItem("🔀 並行: ―", callback=None)
         self._pin_item = rumps.MenuItem("📌 サムをピン留め", callback=self._cmd_toggle_pin)
         self._checkin_item = rumps.MenuItem("🔄 今すぐチェックイン", callback=self._cmd_checkin)
+        self._cards_item = rumps.MenuItem("📚 学びカード", callback=self._cmd_review_cards)
+        self._cards_checked_at = 0.0
         self.menu = [
             self._task_item,
             self._next_item,
@@ -3362,6 +3511,7 @@ class ProgressChecker(rumps.App):
             rumps.MenuItem("🤖 細分タスクを提案してもらう", callback=self._cmd_suggest_tasks),
             rumps.MenuItem("🎯 いま集中すること を編集",   callback=self._cmd_edit_focus),
             rumps.MenuItem("📂 いまのタスクのmdを開く",     callback=self._cmd_open_task_md),
+            self._cards_item,
             None,
             rumps.MenuItem("🧭 手順書を編集（Slack用）",     callback=self._cmd_edit_plan),
             rumps.MenuItem("🤖 手順書を提案してもらう",      callback=self._cmd_suggest_plan),
@@ -3405,6 +3555,7 @@ class ProgressChecker(rumps.App):
         _dnc.addObserver_selector_name_object_(self, "onExternalSuggestPlan:", SUGGEST_PLAN_NOTIFICATION, None)
         _dnc.addObserver_selector_name_object_(self, "onExternalCopyReport:", COPY_REPORT_NOTIFICATION, None)
         _dnc.addObserver_selector_name_object_(self, "onExternalEditKpt:", EDIT_KPT_NOTIFICATION, None)
+        _dnc.addObserver_selector_name_object_(self, "onExternalReviewCards:", REVIEW_CARDS_NOTIFICATION, None)
         self._focus_pull()
         self._import_inbox()
         if not self.data["goals"].get("short"):
@@ -3626,6 +3777,8 @@ class ProgressChecker(rumps.App):
         self._check_date_change()
         self._check_week_change()
         self._check_retro_reminder()
+        if time.time() - self._cards_checked_at > 60:
+            self._update_cards_item()
         # ダイアログ中に届いた受信箱は、閉じたあとの最初の tick で取り込む（モーダル中は rumps.Timer が止まるため）
         if not self._checkin_active and os.path.exists(INBOX_FILE):
             self._import_inbox()
@@ -4591,6 +4744,74 @@ class ProgressChecker(rumps.App):
         if not _md_refs(text):
             text = "\n".join(t.get("text", "") for t in _normalize_today(self.data["goals"].get("today", [])))
         _open_md_refs(text)
+
+    # ── 学びカード（Scrapboxの学びを間隔反復で振り返る。ロジックは manabi-cards/server.py） ──────
+
+    def _update_cards_item(self):
+        """メニューの「📚 学びカード」に今日の枚数を出す。"""
+        self._cards_checked_at = time.time()
+        try:
+            cards, st = _manabi_today()
+            if not st:
+                self._cards_item.title = "📚 学びカード"
+            elif st.get("reviewed_today") and not cards:
+                self._cards_item.title = "📚 学びカード（今日は済み）"
+            elif cards:
+                self._cards_item.title = f"📚 学びカード（今日 {len(cards)}枚・5分）"
+            else:
+                self._cards_item.title = "📚 学びカード（今日の分なし）"
+        except Exception:
+            pass
+
+    def _mark_card_task_done(self):
+        """今日の目標にある「📚 学びカード…」の行（朝の催促で入る）を完了にする。"""
+        changed = False
+        for t in self.data["goals"].get("today", []):
+            if isinstance(t, dict) and str(t.get("text", "")).startswith("📚 学びカード") and not t.get("done"):
+                t["done"] = True
+                changed = True
+        if changed:
+            self._save()
+            self._refresh_ui()
+
+    def _review_cards(self):
+        if self._checkin_active:
+            return
+        m = _manabi()
+        if m is None:
+            notify("📚 学びカード", "manabi-cards が見つかりません", MANABI_DIR)
+            return
+        try:
+            cards, st = m.session_cards()
+        except Exception as e:
+            notify("📚 学びカード", "カードを読めませんでした", str(e)[:80])
+            return
+        if not cards:
+            notify("📚 学びカード", "今日の分は済んでいます" if st.get("reviewed_today") else "今日出すカードはありません", "")
+            return
+        try:
+            m.mark_new_introduced([c["id"] for c in cards if c.get("new")])
+        except Exception:
+            pass
+        random.shuffle(cards)
+        self._checkin_active = True
+        try:
+            n = show_card_review(cards, lambda cid, r, memo, recall: m.rate(cid, r, memo=memo, recall=recall), m.INTERVALS)
+        finally:
+            self._checkin_active = False
+        if n:
+            self._mark_card_task_done()
+            notify("📚 学びカード", f"{n}枚を振り返りました", "")
+        self._update_cards_item()
+
+    def _cmd_review_cards(self, _):
+        self._review_cards()
+
+    def onExternalReviewCards_(self, notif):
+        if not _is_fresh_trigger(notif.userInfo()):
+            return
+        NSApp.activateIgnoringOtherApps_(True)
+        self._review_cards()
 
     def _cmd_edit_focus(self, _):
         self._edit_focus()

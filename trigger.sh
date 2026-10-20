@@ -9,6 +9,7 @@
 #   trigger.sh suggest-plan Claude に手順書を提案させる（Slackのやりとり＋mdを読む。受信箱経由で届く）
 #   trigger.sh report       今日の日報（KPT画面に書いたもの）をSlack用にそのままクリップボードへ
 #   trigger.sh kpt          今日の日報（KPT画面）を開く
+#   trigger.sh cards        学びカード（Scrapboxの学びの間隔反復）を1枚ずつ振り返る
 # 送信時刻を添えるので、ダイアログ表示中に押した分は（閉じた後に配送されても）捨てられる。
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="$DIR/.venv/bin/python"
@@ -23,7 +24,8 @@ case "${1:-checkin}" in
   suggest-plan) NAME="jp.tekuteku.suggest-plan" ;;
   report)       NAME="jp.tekuteku.copy-report" ;;
   kpt)          NAME="jp.tekuteku.edit-kpt" ;;
-  *) echo "usage: trigger.sh checkin|edit-today|suggest|focus|reload-inbox|plan|suggest-plan|report|kpt" >&2; exit 2 ;;
+  cards)        NAME="jp.tekuteku.cards" ;;
+  *) echo "usage: trigger.sh checkin|edit-today|suggest|focus|reload-inbox|plan|suggest-plan|report|kpt|cards" >&2; exit 2 ;;
 esac
 exec "$PY" - "$NAME" <<'PYEOF'
 import sys, time
