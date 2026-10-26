@@ -1662,11 +1662,14 @@ def show_card_review(cards: list, rate_fn, intervals: list) -> int:
         st["i"] += 1
         load()
 
-    widgets["reveal"] = _link_btn(cv, "答えを見る ⏎", NSMakeRect(20, 52, 130, 32), reveal)
-    widgets["reveal"].setKeyEquivalent_("\r")
-    widgets["ok"] = _link_btn(cv, "✅ 思い出せた", NSMakeRect(160, 52, 140, 32), lambda: rate("ok"))
-    widgets["so"] = _link_btn(cv, "🟡 だいたい", NSMakeRect(310, 52, 130, 32), lambda: rate("so"))
-    widgets["ng"] = _link_btn(cv, "❌ 忘れてた", NSMakeRect(450, 52, 130, 32), lambda: rate("ng"))
+    # ⌘⏎ / ⌘1 / ⌘2 / ⌘3 で押せる。素の Enter は日本語変換の確定に使うので割り当てない（2026-10-26 本人指示）
+    widgets["reveal"] = _link_btn(cv, "答えを見る ⌘⏎", NSMakeRect(20, 52, 130, 32), reveal)
+    widgets["ok"] = _link_btn(cv, "✅ 思い出せた ⌘1", NSMakeRect(160, 52, 140, 32), lambda: rate("ok"))
+    widgets["so"] = _link_btn(cv, "🟡 だいたい ⌘2", NSMakeRect(310, 52, 130, 32), lambda: rate("so"))
+    widgets["ng"] = _link_btn(cv, "❌ 忘れてた ⌘3", NSMakeRect(450, 52, 130, 32), lambda: rate("ng"))
+    for k, key in (("reveal", "\r"), ("ok", "1"), ("so", "2"), ("ng", "3")):
+        widgets[k].setKeyEquivalent_(key)
+        widgets[k].setKeyEquivalentModifierMask_(NSEventModifierFlagCommand)
     widgets["src"] = _link_btn(cv, "📄 出典（Scrapbox）を開く", NSMakeRect(20, 12, 200, 32), open_src)
     _btn(cv, "閉じる", _BTN2, NSMakeRect(W - 120, 12, 100, 32))
     cv.addSubview_(_label("間隔: 思い出せた→" + "→".join(str(d) for d in intervals) + "日と伸びる。忘れてた→翌日",
